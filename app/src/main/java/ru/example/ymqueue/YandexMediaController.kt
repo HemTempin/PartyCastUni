@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.media.MediaMetadata
 import android.os.SystemClock
 
 object YandexMediaController {
@@ -25,6 +26,15 @@ object YandexMediaController {
     fun next(context: Context) = controller(context)?.transportControls?.skipToNext() ?: Unit
     fun previous(context: Context) = controller(context)?.transportControls?.skipToPrevious() ?: Unit
     fun isPlaying(context: Context): Boolean = controller(context)?.playbackState?.state == PlaybackState.STATE_PLAYING
+
+    fun currentTrackToken(context: Context): String {
+        val metadata = controller(context)?.metadata ?: return ""
+        val mediaId = metadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID).orEmpty()
+        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
+        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
+        val duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
+        return listOf(mediaId, title, artist, duration.toString()).joinToString("|")
+    }
 
     fun seekBy(context: Context, deltaMs: Long) {
         val c = controller(context) ?: return

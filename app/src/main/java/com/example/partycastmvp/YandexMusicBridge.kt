@@ -144,6 +144,9 @@ object YandexMusicBridge {
     fun isPlaying(context: Context): Boolean = YandexMediaController.isPlaying(context.applicationContext)
 
     @JvmStatic
+    fun currentTrackToken(context: Context): String = YandexMediaController.currentTrackToken(context.applicationContext)
+
+    @JvmStatic
     fun status(context: Context): String = YandexMediaController.status(context.applicationContext)
 
     @JvmStatic

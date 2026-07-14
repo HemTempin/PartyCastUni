@@ -11,8 +11,8 @@ android {
         applicationId 'com.example.partycastmvp'
         minSdk 26
         targetSdk 35
-        versionCode 11
-        versionName '0.8.1-partycast-queue-fix'
+        versionCode 13
+        versionName '0.9.1'
     }
 
     compileOptions {

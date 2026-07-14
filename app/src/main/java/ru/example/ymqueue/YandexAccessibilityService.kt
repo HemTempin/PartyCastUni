@@ -38,7 +38,7 @@ class YandexAccessibilityService : AccessibilityService() {
         data object None : PendingAction()
         data class AddCurrentTrackToQueue(
             val createdAt: Long = System.currentTimeMillis(),
-            val returnToApp: Boolean = true,
+            val returnToApp: Boolean = false,
             val expectedTrackId: String? = null,
             val openedUrl: String? = null,
             val preferTrackRowMenu: Boolean = false,
@@ -221,6 +221,10 @@ class YandexAccessibilityService : AccessibilityService() {
 
         if (returnToApp) {
             handler.postDelayed({ openOwnApp(message) }, if (success) 950 else 250)
+        } else {
+            // Leave Yandex Music through Android's task history. This returns to the app that was
+            // in the foreground before the deep link instead of forcing PartyCast to the front.
+            handler.postDelayed({ performGlobalAction(GLOBAL_ACTION_BACK) }, if (success) 950 else 250)
         }
     }
 

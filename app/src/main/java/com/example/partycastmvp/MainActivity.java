@@ -35,6 +35,8 @@ import java.net.NetworkInterface;
 import java.util.Enumeration;
 import java.util.Locale;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     public static final String EXTRA_AUTOMATION_STATUS = "com.example.partycastmvp.EXTRA_AUTOMATION_STATUS";
@@ -78,6 +80,7 @@ public class MainActivity extends Activity {
     private String currentRoomCode = "";
     private String lastHostIp = "";
     private boolean testModeEnabled = false;
+    private final ExecutorService fileTransferExecutor = Executors.newSingleThreadExecutor();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -183,6 +186,7 @@ public class MainActivity extends Activity {
         if (hostPlayer != null) {
             hostPlayer.stopAll();
         }
+        fileTransferExecutor.shutdownNow();
     }
 
     private void buildUi() {
@@ -301,7 +305,7 @@ public class MainActivity extends Activity {
         nowPlayingProgress.setProgress(0);
         playingCard.addView(nowPlayingProgress, matchWrap());
         playingCard.addView(buttonRow(
-                smallButton("◀", v -> YandexMusicBridge.previous(this)),
+                smallButton("◀", v -> hostPlayer.previous()),
                 roundPlayButton(v -> hostPlayer.pauseOrResume()),
                 smallButton("▶", v -> hostPlayer.skip())
         ), matchWrap());
@@ -361,13 +365,14 @@ public class MainActivity extends Activity {
         queueIndexInput.setText("1");
         controlCard.addView(queueIndexInput, matchWrap());
         controlCard.addView(buttonRow(
+                smallButton("Назад", v -> sendControlToHost(PartyProtocol.CMD_PREVIOUS, readQueueIndex())),
                 smallButton("Пауза", v -> sendControlToHost(PartyProtocol.CMD_PAUSE_RESUME, readQueueIndex())),
-                smallButton("Далее", v -> sendControlToHost(PartyProtocol.CMD_SKIP, readQueueIndex())),
-                smallButton("Удалить", v -> sendControlToHost(PartyProtocol.CMD_REMOVE, readQueueIndex()))
+                smallButton("Далее", v -> sendControlToHost(PartyProtocol.CMD_SKIP, readQueueIndex()))
         ), matchWrap());
         controlCard.addView(buttonRow(
                 smallButton("Выше", v -> sendControlToHost(PartyProtocol.CMD_MOVE_UP, readQueueIndex())),
-                smallButton("Ниже", v -> sendControlToHost(PartyProtocol.CMD_MOVE_DOWN, readQueueIndex()))
+                smallButton("Ниже", v -> sendControlToHost(PartyProtocol.CMD_MOVE_DOWN, readQueueIndex())),
+                smallButton("Удалить", v -> sendControlToHost(PartyProtocol.CMD_REMOVE, readQueueIndex()))
         ), matchWrap());
         root.addView(controlCard, cardParams());
 
@@ -378,6 +383,11 @@ public class MainActivity extends Activity {
     private void showSettingsScreen() {
         clearScreen();
         addTopBar("НАСТРОЙКИ", "");
+
+        LinearLayout appCard = card();
+        appCard.addView(sectionLabel("О ПРИЛОЖЕНИИ"), matchWrap());
+        appCard.addView(bodyText("PartyCast\nВерсия " + getAppVersionLabel()), matchWrap());
+        root.addView(appCard, cardParams());
 
         LinearLayout accessCard = card();
         accessCard.addView(sectionLabel("ДОСТУПЫ"), matchWrap());
@@ -603,14 +613,14 @@ public class MainActivity extends Activity {
         String displayName = queryDisplayName(uri);
         log("Тестовый режим: добавляю файл на хосте: " + displayName);
 
-        new Thread(() -> {
+        fileTransferExecutor.execute(() -> {
             try {
                 File copied = copyUriToCache(uri, displayName);
                 runOnUiThread(() -> hostPlayer.enqueueFile(displayName, copied));
             } catch (Exception e) {
                 runOnUiThread(() -> log("Не удалось добавить тестовый файл: " + e.getMessage()));
             }
-        }, "partycast-host-test-file").start();
+        });
     }
 
     private File copyUriToCache(Uri uri, String displayName) throws Exception {
@@ -643,15 +653,16 @@ public class MainActivity extends Activity {
 
         String displayName = queryDisplayName(uri);
         long size = querySize(uri);
+        String roomCode = getRoomCode();
         log("Отправка файла: " + displayName + " → " + host);
 
-        new Thread(() -> {
+        fileTransferExecutor.execute(() -> {
             final int[] lastPercent = {-10};
             try {
                 PartyProtocol.sendAudioFile(
                         host,
                         PartyProtocol.DEFAULT_PORT,
-                        getRoomCode(),
+                        roomCode,
                         getContentResolver(),
                         uri,
                         displayName,
@@ -671,7 +682,7 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 runOnUiThread(() -> log("Ошибка отправки файла: " + e.getMessage()));
             }
-        }, "partycast-send-file").start();
+        });
     }
 
     private void sendLinkToHost() {
@@ -843,6 +854,17 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {
         }
         return result;
+    }
+
+    @SuppressWarnings("deprecation")
+    private String getAppVersionLabel() {
+        try {
+            android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            String name = info.versionName == null || info.versionName.trim().isEmpty() ? "неизвестна" : info.versionName;
+            return name + " (" + info.versionCode + ")";
+        } catch (Exception ignored) {
+            return "неизвестна";
+        }
     }
 
     private long querySize(Uri uri) {

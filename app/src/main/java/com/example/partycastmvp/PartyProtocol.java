@@ -7,6 +7,7 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -28,6 +29,7 @@ public final class PartyProtocol {
     public static final int TYPE_CONTROL = 3;
     public static final int TYPE_PING = 4;
     public static final int TYPE_PONG = 5;
+    public static final int TYPE_ACK = 6;
 
     public static final String CMD_SKIP = "SKIP";
     public static final String CMD_PAUSE_RESUME = "PAUSE_RESUME";
@@ -35,6 +37,7 @@ public final class PartyProtocol {
     public static final String CMD_MOVE_UP = "MOVE_UP";
     public static final String CMD_MOVE_DOWN = "MOVE_DOWN";
     public static final String CMD_REMOVE = "REMOVE";
+    public static final String CMD_PREVIOUS = "PREVIOUS";
 
     public static final int BUFFER_SIZE = 64 * 1024;
     private static final int DEFAULT_CONNECT_TIMEOUT_MS = 6000;
@@ -95,6 +98,13 @@ public final class PartyProtocol {
                 }
             }
             out.flush();
+
+            // The next queued upload must not start until the host has fully stored this file.
+            socket.shutdownOutput();
+            AckResult ack = readAck(socket);
+            if (ack != null && !ack.accepted) {
+                throw new IOException(ack.message.isEmpty() ? "Хост отклонил аудиофайл" : ack.message);
+            }
         }
     }
 
@@ -168,6 +178,39 @@ public final class PartyProtocol {
         writeHeader(out, roomCode, TYPE_PONG);
         out.writeUTF(label == null || label.trim().isEmpty() ? "PartyCast Host" : label.trim());
         out.flush();
+    }
+
+    public static void sendAck(Socket socket, String roomCode, boolean accepted, String message) throws IOException {
+        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        writeHeader(out, roomCode, TYPE_ACK);
+        out.writeBoolean(accepted);
+        out.writeUTF(message == null ? "" : message);
+        out.flush();
+    }
+
+    private static AckResult readAck(Socket socket) throws IOException {
+        socket.setSoTimeout(10_000);
+        DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+        final int magic;
+        try {
+            magic = in.readInt();
+        } catch (EOFException legacyHostWithoutAck) {
+            // Compatibility with hosts from before acknowledgements were introduced.
+            return null;
+        }
+        if (magic != MAGIC) {
+            throw new IOException("Неверное подтверждение хоста");
+        }
+        int version = in.readInt();
+        if (version < 1 || version > VERSION) {
+            throw new IOException("Неподдерживаемая версия подтверждения: " + version);
+        }
+        in.readUTF();
+        int type = in.readInt();
+        if (type != TYPE_ACK) {
+            throw new IOException("Хост прислал неожиданный ответ: " + type);
+        }
+        return new AckResult(in.readBoolean(), in.readUTF());
     }
 
     private static Socket openSocket(String host, int port, SocketFactory socketFactory, int timeoutMs) throws IOException {
@@ -317,6 +360,16 @@ public final class PartyProtocol {
             this.port = port;
             this.roomCode = normalizeRoomCode(roomCode);
             this.label = label == null || label.trim().isEmpty() ? "PartyCast Host" : label.trim();
+        }
+    }
+
+    private static final class AckResult {
+        final boolean accepted;
+        final String message;
+
+        AckResult(boolean accepted, String message) {
+            this.accepted = accepted;
+            this.message = message == null ? "" : message;
         }
     }
 }

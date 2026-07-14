@@ -54,6 +54,7 @@ public final class HostPlayer {
     private final Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final List<QueueItem> queue = new ArrayList<>();
+    private final List<QueueItem> history = new ArrayList<>();
     private final AudioManager audioManager;
     private final ExternalServicePlaybackController externalPlaybackController;
 
@@ -64,6 +65,8 @@ public final class HostPlayer {
     private QueueItem currentItem;
     private boolean pausedBecauseFocusLoss = false;
     private AudioFocusRequest focusRequest;
+    private boolean waitingForYandexTrackEnd = false;
+    private String waitingYandexTrackToken = "";
 
     private final Runnable localProgressTicker = new Runnable() {
         @Override
@@ -72,6 +75,35 @@ public final class HostPlayer {
             if (mediaPlayer != null && currentItem != null && currentItem.kind == KIND_FILE) {
                 mainHandler.postDelayed(this, 500);
             }
+        }
+    };
+    private final Runnable yandexQueueWatcher = new Runnable() {
+        @Override
+        public void run() {
+            if (!waitingForYandexTrackEnd || queue.isEmpty() || !isIdleInsidePartyCast()) {
+                stopWaitingForYandexTrackEnd();
+                return;
+            }
+
+            boolean yandexPlaying = isYandexPlaying();
+            String currentToken = getYandexTrackToken();
+            if (waitingYandexTrackToken.isEmpty() && !currentToken.isEmpty()) {
+                waitingYandexTrackToken = currentToken;
+            }
+
+            boolean trackChanged = !waitingYandexTrackToken.isEmpty()
+                    && !currentToken.isEmpty()
+                    && !waitingYandexTrackToken.equals(currentToken);
+            if (!yandexPlaying || trackChanged) {
+                log(trackChanged
+                        ? "Трек Яндекс Музыки завершился: запускаю ожидающий файл PartyCast"
+                        : "Яндекс Музыка остановилась: запускаю ожидающий файл PartyCast");
+                stopWaitingForYandexTrackEnd();
+                playNext();
+                return;
+            }
+
+            mainHandler.postDelayed(this, 750);
         }
     };
     private final AudioManager.OnAudioFocusChangeListener focusChangeListener = this::onAudioFocusChange;
@@ -160,6 +192,8 @@ public final class HostPlayer {
             moveDown(queueIndex);
         } else if (PartyProtocol.CMD_REMOVE.equals(command)) {
             removeFromQueue(queueIndex);
+        } else if (PartyProtocol.CMD_PREVIOUS.equals(command)) {
+            previous();
         } else {
             log("Неизвестная команда управления: " + command);
         }
@@ -173,8 +207,48 @@ public final class HostPlayer {
         }
 
         log("Пропуск текущего трека PartyCast");
+        rememberCurrentItem();
         releaseCurrentPlayback(false);
         playNext();
+    }
+
+    public void previous() {
+        if (mediaPlayer != null && currentItem != null && currentItem.kind == KIND_FILE) {
+            try {
+                if (mediaPlayer.getCurrentPosition() > 3000) {
+                    mediaPlayer.seekTo(0);
+                    startLocalProgressUpdates();
+                    log("Текущий трек запущен сначала");
+                    return;
+                }
+            } catch (IllegalStateException ignored) {
+            }
+        }
+
+        if (history.isEmpty()) {
+            if (currentItem == null) {
+                YandexMusicBridge.previous(context);
+                log("Яндекс Музыка: отправлена команда Предыдущий трек");
+            } else {
+                log("Предыдущего трека PartyCast пока нет");
+            }
+            return;
+        }
+
+        QueueItem previousItem = history.remove(history.size() - 1);
+        if (currentItem != null) {
+            queue.add(0, currentItem);
+        }
+        releaseCurrentPlayback(false);
+        stopWaitingForYandexTrackEnd();
+        currentItem = previousItem;
+        log("Возвращаю предыдущий трек: " + previousItem.title);
+        notifyQueueChanged();
+        if (previousItem.kind == KIND_LINK) {
+            playCurrentLink();
+        } else {
+            playCurrentFile();
+        }
     }
 
     public void pauseOrResume() {
@@ -206,6 +280,8 @@ public final class HostPlayer {
 
     public void stopAll() {
         queue.clear();
+        history.clear();
+        stopWaitingForYandexTrackEnd();
         resumeYandexAfterLocalQueue = false;
         releaseCurrentPlayback(true);
         notifyQueueChanged();
@@ -250,6 +326,7 @@ public final class HostPlayer {
     public void onOnlinePlaybackFinished() {
         if (currentItem != null && currentItem.kind == KIND_LINK) {
             log("Онлайн-трек завершён: " + currentItem.title);
+            rememberCurrentItem();
             releaseCurrentPlayback(false);
             playNext();
         }
@@ -268,11 +345,37 @@ public final class HostPlayer {
 
         if (isYandexPlaying()) {
             log(waitMessage + " Чтобы вручную перейти к очереди PartyCast, нажмите «Следующий трек» на хосте.");
+            waitForYandexTrackEnd();
             notifyQueueChanged();
             return;
         }
 
+        stopWaitingForYandexTrackEnd();
         playNext();
+    }
+
+    private void waitForYandexTrackEnd() {
+        if (!waitingForYandexTrackEnd) {
+            waitingForYandexTrackEnd = true;
+            waitingYandexTrackToken = getYandexTrackToken();
+        }
+        mainHandler.removeCallbacks(yandexQueueWatcher);
+        mainHandler.postDelayed(yandexQueueWatcher, 750);
+    }
+
+    private void stopWaitingForYandexTrackEnd() {
+        waitingForYandexTrackEnd = false;
+        waitingYandexTrackToken = "";
+        mainHandler.removeCallbacks(yandexQueueWatcher);
+    }
+
+    private String getYandexTrackToken() {
+        try {
+            String value = YandexMusicBridge.currentTrackToken(context);
+            return value == null ? "" : value;
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     private boolean isIdleInsidePartyCast() {
@@ -288,6 +391,7 @@ public final class HostPlayer {
     }
 
     private void playNext() {
+        stopWaitingForYandexTrackEnd();
         if (queue.isEmpty()) {
             boolean shouldResumeYandex = resumeYandexAfterLocalQueue;
             releaseCurrentPlayback(true);
@@ -370,6 +474,7 @@ public final class HostPlayer {
             });
             player.setOnCompletionListener(mp -> {
                 log("Трек завершён: " + currentItem.title);
+                rememberCurrentItem();
                 releaseCurrentPlayback(false);
                 playNext();
             });
@@ -540,6 +645,16 @@ public final class HostPlayer {
         pausedBecauseFocusLoss = false;
         if (abandonFocus) {
             abandonAudioFocus();
+        }
+    }
+
+    private void rememberCurrentItem() {
+        if (currentItem == null) {
+            return;
+        }
+        history.add(currentItem);
+        if (history.size() > 50) {
+            history.remove(0);
         }
     }
 

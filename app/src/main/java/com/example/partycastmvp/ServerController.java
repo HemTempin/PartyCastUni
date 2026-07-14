@@ -27,7 +27,8 @@ public final class ServerController {
     private final Listener listener;
     private final RoomCodeProvider roomCodeProvider;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService clientExecutor = Executors.newCachedThreadPool();
+    // Preserve the exact arrival order and finish one upload before reading the next one.
+    private final ExecutorService clientExecutor = Executors.newSingleThreadExecutor();
 
     private volatile boolean running = false;
     private ServerSocket serverSocket;
@@ -96,6 +97,11 @@ public final class ServerController {
             PartyProtocol.IncomingMessage msg = PartyProtocol.receiveMessage(closable, receiveDir);
             String expectedRoomCode = PartyProtocol.normalizeRoomCode(roomCodeProvider.getRoomCode());
             if (!expectedRoomCode.isEmpty() && !expectedRoomCode.equals(msg.roomCode)) {
+                if (msg.type == PartyProtocol.TYPE_AUDIO_FILE && msg.audioFile != null && msg.audioFile.exists()) {
+                    // receiveMessage has already written the stream; do not retain rejected uploads.
+                    msg.audioFile.delete();
+                    sendFileAck(closable, expectedRoomCode, false, "Неверный код комнаты");
+                }
                 postLog("Отклонено сообщение от " + remote + ": неверный код комнаты");
                 return;
             }
@@ -106,6 +112,7 @@ public final class ServerController {
             } else if (msg.type == PartyProtocol.TYPE_AUDIO_FILE) {
                 postLog("Получен аудиофайл: " + msg.titleOrUrl);
                 postFileReceived(msg.titleOrUrl, msg.audioFile);
+                sendFileAck(closable, expectedRoomCode, true, "Файл принят");
             } else if (msg.type == PartyProtocol.TYPE_LINK) {
                 postLog("Получена ссылка: " + msg.titleOrUrl);
                 postLinkReceived(msg.titleOrUrl);
@@ -115,6 +122,14 @@ public final class ServerController {
             }
         } catch (IOException e) {
             postLog("Ошибка клиента " + remote + ": " + e.getMessage());
+        }
+    }
+
+    private void sendFileAck(Socket socket, String roomCode, boolean accepted, String message) {
+        try {
+            PartyProtocol.sendAck(socket, roomCode, accepted, message);
+        } catch (IOException e) {
+            postLog("Не удалось подтвердить приём файла: " + e.getMessage());
         }
     }
 
