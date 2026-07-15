@@ -35,11 +35,16 @@ object YandexMusicBridge {
             main.post { callback?.onLog(message) }
         }
 
-        fun startAutomation(expectedTrackId: String?, preferTrackRowMenu: Boolean, trackInfo: TrackInfo?) {
+        fun startAutomation(
+            expectedTrackId: String?,
+            preferTrackRowMenu: Boolean,
+            trackInfo: TrackInfo?,
+            targetUrl: String = url
+        ) {
             try {
                 YandexQueueAutomation.addTrackToQueue(
                     context = appContext,
-                    url = url,
+                    url = targetUrl,
                     expectedTrackId = expectedTrackId,
                     preferTrackRowMenu = preferTrackRowMenu,
                     trackInfo = trackInfo
@@ -48,13 +53,14 @@ object YandexMusicBridge {
                 main.postDelayed({
                     val action = YandexAccessibilityService.pendingAction
                     if (action is YandexAccessibilityService.PendingAction.AddCurrentTrackToQueue &&
-                        action.openedUrl == url
+                        action.openedUrl == targetUrl &&
+                        !YandexAccessibilityService.isScenarioRunning()
                     ) {
                         log("Я.Музыка: первая попытка ещё не завершилась, мягко повторяю открытие ссылки")
                         try {
                             YandexQueueAutomation.addTrackToQueue(
                                 context = appContext,
-                                url = url,
+                                url = targetUrl,
                                 expectedTrackId = expectedTrackId,
                                 preferTrackRowMenu = preferTrackRowMenu,
                                 trackInfo = trackInfo
@@ -80,12 +86,24 @@ object YandexMusicBridge {
             return
         }
 
+        try {
+            YandexQueueAutomation.openTrack(appContext, url)
+            log("Я.Музыка: ссылка открыта, готовлю добавление следующим треком")
+        } catch (t: Throwable) {
+            log("Я.Музыка: не удалось открыть ссылку — ${t.message ?: t.javaClass.simpleName}")
+        }
+
         val albumSuffix = normalized.albumId?.let { ", albumId=$it" }.orEmpty()
         log("Я.Музыка: готовлю добавление следующим, trackId=${normalized.trackId}$albumSuffix")
 
         Thread {
             val trackInfo: TrackInfo? = try {
                 YandexTrackApiResolver.resolve(normalized)
+                    ?: if (normalized.wasAlbumTrackLink) {
+                        YandexTrackApiResolver.resolve(normalized.trackId)
+                    } else {
+                        null
+                    }
             } catch (_: Throwable) {
                 null
             }
@@ -99,8 +117,10 @@ object YandexMusicBridge {
                 } else if (normalized.wasAlbumTrackLink) {
                     callback?.onLog(
                         "Я.Музыка: API не вернул title для album/track ссылки. " +
-                            "Автоматизацию не запускаю, чтобы не добавить соседний трек или весь альбом."
+                            "Перехожу к безопасному одиночному track URL."
                     )
+                    val standalone = TrackLinkParser.buildStandaloneTrackUrl(normalized.trackId)
+                    startAutomation(normalized.trackId, false, null, standalone)
                 } else {
                     callback?.onLog("Я.Музыка: API не вернул title/artist, запускаю старую стабильную логику для одиночного трека")
                     startAutomation(normalized.trackId, false, null)
@@ -147,6 +167,9 @@ object YandexMusicBridge {
     fun currentTrackToken(context: Context): String = YandexMediaController.currentTrackToken(context.applicationContext)
 
     @JvmStatic
+    fun currentTrackDetails(context: Context): Array<String> = YandexMediaController.currentTrackDetails(context.applicationContext)
+
+    @JvmStatic
     fun status(context: Context): String = YandexMediaController.status(context.applicationContext)
 
     @JvmStatic
@@ -165,5 +188,20 @@ object YandexMusicBridge {
     @JvmStatic
     fun openAccessibilitySettings(context: Context) {
         context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+
+    @JvmStatic
+    fun accessibilityDiagnosticStatus(): String = YandexAccessibilityService.connectionStatus()
+
+    @JvmStatic
+    fun lastAccessibilityDiagnostic(): String = YandexAccessibilityService.lastDiagnosticReport
+
+    @JvmStatic
+    fun runAccessibilityDiagnostic(context: Context): Boolean {
+        if (!YandexAccessibilityService.isServiceConnected()) return false
+        val intent = context.packageManager.getLaunchIntentForPackage(YANDEX_MUSIC_PACKAGE) ?: return false
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+        return YandexAccessibilityService.requestDiagnostic()
     }
 }

@@ -14,6 +14,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 import javax.net.SocketFactory;
 
@@ -30,6 +33,8 @@ public final class PartyProtocol {
     public static final int TYPE_PING = 4;
     public static final int TYPE_PONG = 5;
     public static final int TYPE_ACK = 6;
+    public static final int TYPE_QUEUE_REQUEST = 7;
+    public static final int TYPE_QUEUE_SNAPSHOT = 8;
 
     public static final String CMD_SKIP = "SKIP";
     public static final String CMD_PAUSE_RESUME = "PAUSE_RESUME";
@@ -38,6 +43,7 @@ public final class PartyProtocol {
     public static final String CMD_MOVE_DOWN = "MOVE_DOWN";
     public static final String CMD_REMOVE = "REMOVE";
     public static final String CMD_PREVIOUS = "PREVIOUS";
+    public static final String CMD_MOVE_TO_PREFIX = "MOVE_TO:";
 
     public static final int BUFFER_SIZE = 64 * 1024;
     private static final int DEFAULT_CONNECT_TIMEOUT_MS = 6000;
@@ -122,6 +128,11 @@ public final class PartyProtocol {
             writeHeader(out, roomCode, TYPE_LINK);
             out.writeUTF(url.trim());
             out.flush();
+            socket.shutdownOutput();
+            AckResult ack = readAck(socket);
+            if (ack != null && !ack.accepted) {
+                throw new IOException(ack.message.isEmpty() ? "Хост отклонил ссылку" : ack.message);
+            }
         }
     }
 
@@ -173,6 +184,46 @@ public final class PartyProtocol {
         }
     }
 
+    public static QueueSnapshot requestQueueSnapshot(
+            String host,
+            int port,
+            String roomCode,
+            SocketFactory socketFactory,
+            int timeoutMs
+    ) throws IOException {
+        try (Socket socket = openSocket(host, port, socketFactory, timeoutMs);
+             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()))) {
+            socket.setSoTimeout(timeoutMs);
+            writeHeader(out, roomCode, TYPE_QUEUE_REQUEST);
+            out.flush();
+
+            int magic = in.readInt();
+            if (magic != MAGIC) {
+                throw new IOException("Неверный ответ очереди");
+            }
+            int version = in.readInt();
+            if (version < 2 || version > VERSION) {
+                throw new IOException("Неподдерживаемая версия снимка очереди: " + version);
+            }
+            String responseRoomCode = normalizeRoomCode(in.readUTF());
+            int type = in.readInt();
+            if (type != TYPE_QUEUE_SNAPSHOT) {
+                throw new IOException("Ожидался снимок очереди, получен type=" + type);
+            }
+            String nowTitle = in.readUTF();
+            String nowArtist = in.readUTF();
+            String nowSource = in.readUTF();
+            boolean playing = in.readBoolean();
+            int count = Math.max(0, Math.min(in.readInt(), 500));
+            List<QueueItemData> items = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                items.add(new QueueItemData(in.readUTF(), in.readUTF(), in.readUTF()));
+            }
+            return new QueueSnapshot(responseRoomCode, nowTitle, nowArtist, nowSource, playing, items);
+        }
+    }
+
     public static void sendPong(Socket socket, String roomCode, String label) throws IOException {
         DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         writeHeader(out, roomCode, TYPE_PONG);
@@ -185,6 +236,23 @@ public final class PartyProtocol {
         writeHeader(out, roomCode, TYPE_ACK);
         out.writeBoolean(accepted);
         out.writeUTF(message == null ? "" : message);
+        out.flush();
+    }
+
+    public static void sendQueueSnapshot(Socket socket, String roomCode, QueueSnapshot snapshot) throws IOException {
+        QueueSnapshot safe = snapshot == null ? QueueSnapshot.empty(roomCode) : snapshot;
+        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        writeHeader(out, roomCode, TYPE_QUEUE_SNAPSHOT);
+        out.writeUTF(safe.nowTitle);
+        out.writeUTF(safe.nowArtist);
+        out.writeUTF(safe.nowSource);
+        out.writeBoolean(safe.playing);
+        out.writeInt(safe.items.size());
+        for (QueueItemData item : safe.items) {
+            out.writeUTF(item.title);
+            out.writeUTF(item.artist);
+            out.writeUTF(item.source);
+        }
         out.flush();
     }
 
@@ -296,6 +364,10 @@ public final class PartyProtocol {
             return IncomingMessage.ping(roomCode, clientLabel);
         }
 
+        if (type == TYPE_QUEUE_REQUEST) {
+            return IncomingMessage.queueRequest(roomCode);
+        }
+
         throw new IOException("Неизвестный тип сообщения: " + type);
     }
 
@@ -346,6 +418,44 @@ public final class PartyProtocol {
 
         public static IncomingMessage ping(String roomCode, String pingLabel) {
             return new IncomingMessage(TYPE_PING, roomCode, null, null, null, -1, pingLabel);
+        }
+
+        public static IncomingMessage queueRequest(String roomCode) {
+            return new IncomingMessage(TYPE_QUEUE_REQUEST, roomCode, null, null, null, -1, null);
+        }
+    }
+
+    public static final class QueueItemData {
+        public final String title;
+        public final String artist;
+        public final String source;
+
+        public QueueItemData(String title, String artist, String source) {
+            this.title = title == null ? "" : title;
+            this.artist = artist == null ? "" : artist;
+            this.source = source == null ? "" : source;
+        }
+    }
+
+    public static final class QueueSnapshot {
+        public final String roomCode;
+        public final String nowTitle;
+        public final String nowArtist;
+        public final String nowSource;
+        public final boolean playing;
+        public final List<QueueItemData> items;
+
+        public QueueSnapshot(String roomCode, String nowTitle, String nowArtist, String nowSource, boolean playing, List<QueueItemData> items) {
+            this.roomCode = normalizeRoomCode(roomCode);
+            this.nowTitle = nowTitle == null ? "" : nowTitle;
+            this.nowArtist = nowArtist == null ? "" : nowArtist;
+            this.nowSource = nowSource == null ? "" : nowSource;
+            this.playing = playing;
+            this.items = Collections.unmodifiableList(new ArrayList<>(items == null ? Collections.emptyList() : items));
+        }
+
+        public static QueueSnapshot empty(String roomCode) {
+            return new QueueSnapshot(roomCode, "", "", "", false, Collections.emptyList());
         }
     }
 

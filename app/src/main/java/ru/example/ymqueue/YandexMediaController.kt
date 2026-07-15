@@ -36,6 +36,18 @@ object YandexMediaController {
         return listOf(mediaId, title, artist, duration.toString()).joinToString("|")
     }
 
+    fun currentTrackDetails(context: Context): Array<String> {
+        val c = controller(context) ?: return emptyArray()
+        val metadata = c.metadata ?: return emptyArray()
+        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
+        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
+        if (title.isBlank() && artist.isBlank()) return emptyArray()
+        val duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(0L)
+        val position = c.playbackState?.position?.coerceAtLeast(0L) ?: 0L
+        val playing = c.playbackState?.state == PlaybackState.STATE_PLAYING
+        return arrayOf(title, artist, duration.toString(), position.toString(), playing.toString())
+    }
+
     fun seekBy(context: Context, deltaMs: Long) {
         val c = controller(context) ?: return
         val current = c.playbackState?.position ?: return

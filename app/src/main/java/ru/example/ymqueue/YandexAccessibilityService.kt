@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Toast
 import kotlin.math.abs
 
 class YandexAccessibilityService : AccessibilityService() {
@@ -33,6 +34,7 @@ class YandexAccessibilityService : AccessibilityService() {
     private var albumSafeRowMenuGestureSent = false
     private var albumTargetRowTapSent = false
     private var albumTargetRowDescription: String = ""
+    private var miniPlayerExpanded = false
 
     sealed class PendingAction {
         data object None : PendingAction()
@@ -45,6 +47,9 @@ class YandexAccessibilityService : AccessibilityService() {
             val expectedTrackTitle: String? = null,
             val expectedArtists: List<String> = emptyList()
         ) : PendingAction()
+        data class Diagnostic(
+            val createdAt: Long = System.currentTimeMillis()
+        ) : PendingAction()
     }
 
     companion object {
@@ -52,10 +57,55 @@ class YandexAccessibilityService : AccessibilityService() {
         private const val EXTRA_AUTOMATION_STATUS = "com.example.partycastmvp.EXTRA_AUTOMATION_STATUS"
 
         @Volatile
+        private var activeService: YandexAccessibilityService? = null
+
+        @Volatile
         var pendingAction: PendingAction = PendingAction.None
 
         @Volatile
         var lastHierarchyDump: String = ""
+
+        @Volatile
+        var lastDiagnosticReport: String = "Проверка ещё не запускалась"
+
+        fun kickPendingAction() {
+            activeService?.kickPendingActionFromApp()
+        }
+
+        fun isScenarioRunning(): Boolean = activeService?.scenarioRunning == true
+
+        fun isServiceConnected(): Boolean = activeService != null
+
+        fun requestDiagnostic(): Boolean {
+            val service = activeService ?: return false
+            if (service.scenarioRunning) return false
+            pendingAction = PendingAction.Diagnostic()
+            service.kickPendingActionFromApp()
+            return true
+        }
+
+        fun connectionStatus(): String {
+            val service = activeService
+                ?: return "Сервис Accessibility не подключён к PartyCast"
+            val eventAge = if (service.lastYandexUiEventAt > 0L) {
+                "${(System.currentTimeMillis() - service.lastYandexUiEventAt).coerceAtLeast(0L) / 1000} сек. назад"
+            } else {
+                "ещё не получено"
+            }
+            val rootPackage = service.rootInActiveWindow?.packageName?.toString().orEmpty().ifBlank { "нет активного окна" }
+            return buildString {
+                append("Сервис подключён: да")
+                append("\nСценарий выполняется: ").append(if (service.scenarioRunning) "да" else "нет")
+                append("\nПоследнее событие Яндекс Музыки: ").append(eventAge)
+                append("\nАктивное окно: ").append(rootPackage)
+            }
+        }
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        activeService = this
+        kickPendingActionFromApp()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -64,30 +114,100 @@ class YandexAccessibilityService : AccessibilityService() {
 
         lastYandexUiEventAt = System.currentTimeMillis()
 
-        val action = pendingAction
-        if (action is PendingAction.AddCurrentTrackToQueue && !scenarioRunning) {
-            scenarioRunning = true
-            scenarioStartedAt = lastYandexUiEventAt
-            initialYandexUiSettled = false
-            albumSafeRowMenuGestureSent = false
-            albumTargetRowTapSent = false
-            albumTargetRowDescription = ""
-            handler.removeCallbacksAndMessages(null)
-            // Даём Я.Музыке закончить открытие ссылки/анимацию.
-            handler.postDelayed({
-                attemptAddToQueue(
-                    attempt = 0,
-                    returnToApp = action.returnToApp,
-                    expectedTrackId = action.expectedTrackId,
-                    preferTrackRowMenu = action.preferTrackRowMenu,
-                    expectedTrackTitle = action.expectedTrackTitle,
-                    expectedArtists = action.expectedArtists
-                )
-            }, if (action.preferTrackRowMenu) 1700 else 1200)
-        }
+        startPendingScenarioIfNeeded()
     }
 
     override fun onInterrupt() = Unit
+
+    override fun onDestroy() {
+        if (activeService === this) activeService = null
+        handler.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
+    private fun kickPendingActionFromApp() {
+        handler.post { startPendingScenarioIfNeeded() }
+    }
+
+    private fun startPendingScenarioIfNeeded() {
+        val action = pendingAction
+        if (scenarioRunning) return
+
+        if (action is PendingAction.Diagnostic) {
+            scenarioRunning = true
+            handler.removeCallbacksAndMessages(null)
+            handler.postDelayed({ runDiagnosticAttempt(action, 0) }, 1400)
+            return
+        }
+
+        if (action !is PendingAction.AddCurrentTrackToQueue) return
+
+        scenarioRunning = true
+        scenarioStartedAt = System.currentTimeMillis()
+        initialYandexUiSettled = false
+        albumSafeRowMenuGestureSent = false
+        albumTargetRowTapSent = false
+        albumTargetRowDescription = ""
+        miniPlayerExpanded = false
+        handler.removeCallbacksAndMessages(null)
+        // Даём Я.Музыке закончить открытие ссылки/анимацию. Сценарий запускается как
+        // от Accessibility-события, так и от явного сигнала PartyCast.
+        handler.postDelayed({
+            attemptAddToQueue(
+                attempt = 0,
+                returnToApp = action.returnToApp,
+                expectedTrackId = action.expectedTrackId,
+                preferTrackRowMenu = action.preferTrackRowMenu,
+                expectedTrackTitle = action.expectedTrackTitle,
+                expectedArtists = action.expectedArtists
+            )
+        }, if (action.preferTrackRowMenu) 1700 else 1200)
+    }
+
+    private fun runDiagnosticAttempt(action: PendingAction.Diagnostic, attempt: Int) {
+        val root = rootInActiveWindow
+        val rootPackage = root?.packageName?.toString().orEmpty()
+        if ((root == null || rootPackage != YANDEX_MUSIC_PACKAGE) && attempt < 10) {
+            handler.postDelayed({ runDiagnosticAttempt(action, attempt + 1) }, 450)
+            return
+        }
+
+        val report = if (root == null || rootPackage != YANDEX_MUSIC_PACKAGE) {
+            buildString {
+                append("РЕЗУЛЬТАТ: ошибка\n")
+                append("Сервис подключён, но окно Яндекс Музыки не обнаружено.")
+                append("\nТекущее окно: ").append(rootPackage.ifBlank { "не определено" })
+                append("\nСобытие Яндекс Музыки после запуска теста: ")
+                append(if (lastYandexUiEventAt >= action.createdAt) "получено" else "не получено")
+            }
+        } else {
+            updateHierarchyDump(root)
+            val all = mutableListOf<AccessibilityNodeInfo>()
+            collect(root, all)
+            val visible = all.count { it.isVisibleToUser }
+            val labeled = all.count { it.isVisibleToUser && labelOf(it).isNotBlank() }
+            val clickable = all.count { it.isVisibleToUser && it.isClickable }
+            buildString {
+                append("РЕЗУЛЬТАТ: Accessibility работает\n")
+                append("Событие Яндекс Музыки после запуска теста: ")
+                append(if (lastYandexUiEventAt >= action.createdAt) "получено" else "не получено, использован прямой запуск")
+                append("\nПакет активного окна: ").append(rootPackage)
+                append("\nЭлементов в дереве: ").append(all.size)
+                append("; видимых: ").append(visible)
+                append("; с текстом/описанием: ").append(labeled)
+                append("; кликабельных: ").append(clickable)
+                if (lastHierarchyDump.isNotBlank()) {
+                    append("\n\nВИДИМЫЕ ЭЛЕМЕНТЫ:\n").append(lastHierarchyDump)
+                }
+            }
+        }
+
+        lastDiagnosticReport = report
+        pendingAction = PendingAction.None
+        scenarioRunning = false
+        handler.removeCallbacksAndMessages(null)
+        openOwnApp("Accessibility-проверка:\n$report")
+    }
 
     private fun attemptAddToQueue(
         attempt: Int,
@@ -111,10 +231,21 @@ class YandexAccessibilityService : AccessibilityService() {
 
         updateHierarchyDump(root)
 
+        // Deep link может оставить Яндекс Музыку на главном экране, показав нужный
+        // трек только в мини-плеере. В этом случае сначала раскрываем мини-плеер.
+        if (!miniPlayerExpanded && expandExpectedTrackMiniPlayer(root, expectedTrackTitle)) {
+            miniPlayerExpanded = true
+            handler.postDelayed({
+                attemptAddToQueue(0, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists)
+            }, 900)
+            return
+        }
+
         // Для обычных ссылок оставляем рабочую логику fixed5.
         // Для album/track ссылок НЕ нажимаем AddNext до попытки открыть меню строки трека,
         // чтобы не применить команду к меню альбома.
-        val canClickAddNextNow = !preferTrackRowMenu || albumSafeRowMenuGestureSent || albumTargetRowTapSent
+        val albumRowMode = preferTrackRowMenu && !miniPlayerExpanded
+        val canClickAddNextNow = !albumRowMode || albumSafeRowMenuGestureSent || albumTargetRowTapSent
         if (canClickAddNextNow && clickAddNextMenuItem(root)) {
             val idSuffix = expectedTrackId?.let { " (trackId=$it)" }.orEmpty()
             finishScenario(success = true, returnToApp = returnToApp, message = "Нажал пункт добавления трека следующим$idSuffix")
@@ -125,19 +256,19 @@ class YandexAccessibilityService : AccessibilityService() {
         // прокручивал альбом в самый низ, попадая в рекомендации. Теперь прокрутка разрешена
         // только для обычного режима и только если экран действительно похож на bottom-sheet меню.
         val rowMenuAlreadyOpened = albumSafeRowMenuGestureSent || albumTargetRowTapSent
-        if ((!preferTrackRowMenu || rowMenuAlreadyOpened) && looksLikeContextMenuOpen(root) && scrollLikelyMenu(root)) {
+        if ((!albumRowMode || rowMenuAlreadyOpened) && looksLikeContextMenuOpen(root) && scrollLikelyMenu(root)) {
             handler.postDelayed({ attemptAddToQueue(attempt + 1, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists) }, 450)
             return
         }
 
-        val menuOpened = if (preferTrackRowMenu) {
+        val menuOpened = if (albumRowMode) {
             openAlbumTrackRowMenuAttempt(root, attempt, expectedTrackTitle, expectedArtists)
         } else {
             openGenericTrackMenuAttempt(root, attempt)
         }
 
         if (menuOpened) {
-            if (preferTrackRowMenu) albumSafeRowMenuGestureSent = true
+            if (albumRowMode) albumSafeRowMenuGestureSent = true
             handler.postDelayed({ attemptAddToQueue(attempt + 1, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists) }, 800)
         } else {
             retryOrFail(attempt, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists, "Не удалось открыть меню трека")
@@ -153,12 +284,13 @@ class YandexAccessibilityService : AccessibilityService() {
         expectedArtists: List<String> = emptyList(),
         reason: String
     ) {
-        val maxAttempts = if (preferTrackRowMenu) 2 else 8
-        val shouldStopAfterSingleAlbumRowTap = preferTrackRowMenu && albumTargetRowTapSent
+        val albumRowMode = preferTrackRowMenu && !miniPlayerExpanded
+        val maxAttempts = if (albumRowMode) 2 else 8
+        val shouldStopAfterSingleAlbumRowTap = albumRowMode && albumTargetRowTapSent
         if (attempt < maxAttempts && !shouldStopAfterSingleAlbumRowTap) {
             handler.postDelayed({ attemptAddToQueue(attempt + 1, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists) }, 650)
         } else {
-            val safetyNote = if (preferTrackRowMenu) {
+            val safetyNote = if (albumRowMode) {
                 val targetInfo = if (albumTargetRowDescription.isNotBlank()) "\nПоследняя выбранная строка: $albumTargetRowDescription" else ""
                 val apiInfo = expectedTrackTitle?.let { title ->
                     val artists = expectedArtists.joinToString(", ").ifBlank { "без артиста" }
@@ -173,6 +305,50 @@ class YandexAccessibilityService : AccessibilityService() {
             }
             finishScenario(success = false, returnToApp = returnToApp, message = diagnostic)
         }
+    }
+
+    private fun expandExpectedTrackMiniPlayer(
+        root: AccessibilityNodeInfo,
+        expectedTrackTitle: String?
+    ): Boolean {
+        val expected = expectedTrackTitle?.normalizeYm()?.stripExplicitTrackMarkers().orEmpty()
+        if (expected.isBlank()) return false
+
+        val screenHeight = resources.displayMetrics.heightPixels
+        val minY = (screenHeight * 0.76f).toInt()
+        val maxY = (screenHeight * 0.93f).toInt()
+        val all = mutableListOf<AccessibilityNodeInfo>()
+        collect(root, all)
+
+        val candidates = all.mapNotNull { node ->
+            if (!node.isVisibleToUser) return@mapNotNull null
+            val bounds = boundsOf(node)
+            if (bounds.centerY() !in minY..maxY) return@mapNotNull null
+            val label = labelOf(node).normalizeYm().stripExplicitTrackMarkers()
+            if (label.isBlank()) return@mapNotNull null
+            val titleMatches = label == expected ||
+                (label.contains(expected) && label.length <= expected.length + 48) ||
+                (expected.contains(label) && label.length >= 4)
+            if (!titleMatches) return@mapNotNull null
+
+            val clickable = (if (node.isClickable) node else clickableParent(node))?.takeIf {
+                val parentBounds = boundsOf(it)
+                parentBounds.centerY() in minY..maxY && parentBounds.height() <= dp(190)
+            }
+            val targetBounds = clickable?.let { boundsOf(it) } ?: bounds
+            var score = 100
+            if (label == expected) score += 80
+            if (clickable != null) score += 50
+            if (targetBounds.width() > resources.displayMetrics.widthPixels * 0.35f) score += 25
+            Candidate(clickable ?: node, targetBounds, score, label)
+        }.sortedByDescending { it.score }
+
+        val target = candidates.firstOrNull() ?: return false
+        albumTargetRowDescription = "мини-плеер: ${target.label.take(80)} ${target.bounds}"
+        if (target.node.isClickable && target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            return true
+        }
+        return tap(target.bounds.centerX(), target.bounds.centerY())
     }
 
     private fun openGenericTrackMenuAttempt(root: AccessibilityNodeInfo, attempt: Int): Boolean = when (attempt) {
@@ -205,6 +381,7 @@ class YandexAccessibilityService : AccessibilityService() {
     }
 
     private fun finishScenario(success: Boolean, returnToApp: Boolean, message: String) {
+        lastDiagnosticReport = (if (success) "АВТОМАТИЗАЦИЯ: успешно\n" else "АВТОМАТИЗАЦИЯ: ошибка\n") + message
         pendingAction = PendingAction.None
         scenarioRunning = false
         scenarioStartedAt = 0L
@@ -212,7 +389,14 @@ class YandexAccessibilityService : AccessibilityService() {
         albumSafeRowMenuGestureSent = false
         albumTargetRowTapSent = false
         albumTargetRowDescription = ""
+        miniPlayerExpanded = false
         handler.removeCallbacksAndMessages(null)
+
+        Toast.makeText(
+            applicationContext,
+            if (success) "PartyCast: трек добавлен следующим" else "PartyCast: добавить трек не удалось — отчёт сохранён в технических настройках",
+            Toast.LENGTH_LONG
+        ).show()
 
         if (success) {
             // Закрываем bottom-sheet/контекстное меню, не останавливая воспроизведение.

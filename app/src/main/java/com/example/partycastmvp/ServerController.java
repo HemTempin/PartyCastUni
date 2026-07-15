@@ -31,6 +31,7 @@ public final class ServerController {
     private final ExecutorService clientExecutor = Executors.newSingleThreadExecutor();
 
     private volatile boolean running = false;
+    private volatile PartyProtocol.QueueSnapshot queueSnapshot = PartyProtocol.QueueSnapshot.empty("");
     private ServerSocket serverSocket;
     private Thread serverThread;
 
@@ -42,6 +43,10 @@ public final class ServerController {
 
     public boolean isRunning() {
         return running;
+    }
+
+    public void setQueueSnapshot(PartyProtocol.QueueSnapshot snapshot) {
+        queueSnapshot = snapshot == null ? PartyProtocol.QueueSnapshot.empty("") : snapshot;
     }
 
     public void start(int port) {
@@ -101,6 +106,8 @@ public final class ServerController {
                     // receiveMessage has already written the stream; do not retain rejected uploads.
                     msg.audioFile.delete();
                     sendFileAck(closable, expectedRoomCode, false, "Неверный код комнаты");
+                } else if (msg.type == PartyProtocol.TYPE_LINK) {
+                    PartyProtocol.sendAck(closable, expectedRoomCode, false, "Неверный код комнаты");
                 }
                 postLog("Отклонено сообщение от " + remote + ": неверный код комнаты");
                 return;
@@ -109,6 +116,8 @@ public final class ServerController {
             if (msg.type == PartyProtocol.TYPE_PING) {
                 PartyProtocol.sendPong(closable, expectedRoomCode, "PartyCast Host");
                 postLog("PING от клиента " + remote + " — ответил PONG");
+            } else if (msg.type == PartyProtocol.TYPE_QUEUE_REQUEST) {
+                PartyProtocol.sendQueueSnapshot(closable, expectedRoomCode, queueSnapshot);
             } else if (msg.type == PartyProtocol.TYPE_AUDIO_FILE) {
                 postLog("Получен аудиофайл: " + msg.titleOrUrl);
                 postFileReceived(msg.titleOrUrl, msg.audioFile);
@@ -116,6 +125,7 @@ public final class ServerController {
             } else if (msg.type == PartyProtocol.TYPE_LINK) {
                 postLog("Получена ссылка: " + msg.titleOrUrl);
                 postLinkReceived(msg.titleOrUrl);
+                PartyProtocol.sendAck(closable, expectedRoomCode, true, "Ссылка принята");
             } else if (msg.type == PartyProtocol.TYPE_CONTROL) {
                 postLog("Получена команда: " + msg.command + " index=" + msg.queueIndex);
                 postControlReceived(msg.command, msg.queueIndex);

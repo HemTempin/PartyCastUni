@@ -5,6 +5,7 @@ import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
+import android.media.MediaMetadataRetriever;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -12,13 +13,26 @@ import android.os.Looper;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 public final class HostPlayer {
     public interface Listener {
         void onLog(String message);
-        void onQueueChanged(String queueText);
+        void onQueueChanged(String queueText, List<QueueEntry> entries);
         void onLocalNowPlayingChanged(String text, int progressMs, int durationMs, boolean visible);
+    }
+
+    public static final class QueueEntry {
+        public final String title;
+        public final String artist;
+        public final String source;
+
+        QueueEntry(String title, String artist, String source) {
+            this.title = title == null ? "" : title;
+            this.artist = artist == null ? "" : artist;
+            this.source = source == null ? "" : source;
+        }
     }
 
     private static final int KIND_FILE = 1;
@@ -27,26 +41,28 @@ public final class HostPlayer {
     private static final class QueueItem {
         final int kind;
         final String title;
+        final String artist;
         final File file;
         final String url;
         final int service;
 
-        QueueItem(int kind, String title, File file, String url, int service) {
+        QueueItem(int kind, String title, String artist, File file, String url, int service) {
             this.kind = kind;
             this.title = title;
+            this.artist = artist == null ? "" : artist;
             this.file = file;
             this.url = url;
             this.service = service;
         }
 
-        static QueueItem file(String title, File file) {
+        static QueueItem file(String title, String artist, File file) {
             String safeTitle = title == null || title.trim().isEmpty() ? file.getName() : title.trim();
-            return new QueueItem(KIND_FILE, safeTitle, file, null, OnlineLinkHelper.SERVICE_UNKNOWN);
+            return new QueueItem(KIND_FILE, safeTitle, artist, file, null, OnlineLinkHelper.SERVICE_UNKNOWN);
         }
 
         static QueueItem link(String url) {
             int service = OnlineLinkHelper.detectService(url);
-            return new QueueItem(KIND_LINK, OnlineLinkHelper.buildDisplayTitle(url), null, url, service);
+            return new QueueItem(KIND_LINK, OnlineLinkHelper.buildDisplayTitle(url), "", null, url, service);
         }
     }
 
@@ -134,7 +150,8 @@ public final class HostPlayer {
             return;
         }
 
-        QueueItem item = QueueItem.file(title, file);
+        String[] metadata = readFileMetadata(file, title);
+        QueueItem item = QueueItem.file(metadata[0], metadata[1], file);
         queue.add(item);
         log("Добавлено в очередь: " + item.title);
         notifyQueueChanged();
@@ -194,6 +211,13 @@ public final class HostPlayer {
             removeFromQueue(queueIndex);
         } else if (PartyProtocol.CMD_PREVIOUS.equals(command)) {
             previous();
+        } else if (command != null && command.startsWith(PartyProtocol.CMD_MOVE_TO_PREFIX)) {
+            try {
+                int target = Integer.parseInt(command.substring(PartyProtocol.CMD_MOVE_TO_PREFIX.length()));
+                moveTo(queueIndex, target);
+            } catch (NumberFormatException e) {
+                log("Некорректная команда перемещения: " + command);
+            }
         } else {
             log("Неизвестная команда управления: " + command);
         }
@@ -309,6 +333,18 @@ public final class HostPlayer {
         QueueItem item = queue.remove(index);
         queue.add(index + 1, item);
         log("Опущено в очереди: " + item.title);
+        notifyQueueChanged();
+    }
+
+    public void moveTo(int oneBasedFrom, int oneBasedTo) {
+        int from = oneBasedFrom - 1;
+        int to = oneBasedTo - 1;
+        if (from < 0 || from >= queue.size() || to < 0 || to >= queue.size() || from == to) {
+            return;
+        }
+        QueueItem item = queue.remove(from);
+        queue.add(to, item);
+        log("Перемещено в очереди: " + item.title + " → " + oneBasedTo);
         notifyQueueChanged();
     }
 
@@ -699,6 +735,56 @@ public final class HostPlayer {
                 sb.append('\n');
             }
         }
-        listener.onQueueChanged(sb.toString());
+        List<QueueEntry> entries = new ArrayList<>();
+        for (QueueItem item : queue) {
+            String source;
+            String artist = item.artist;
+            if (item.kind == KIND_FILE) {
+                source = "Файл";
+            } else {
+                source = OnlineLinkHelper.detectServiceName(item.url);
+            }
+            entries.add(new QueueEntry(cleanDisplayTitle(item.title, source), artist, source));
+        }
+        listener.onQueueChanged(sb.toString(), Collections.unmodifiableList(entries));
+    }
+
+    private static String[] readFileMetadata(File file, String fallbackTitle) {
+        String title = fallbackTitle == null || fallbackTitle.trim().isEmpty() ? file.getName() : fallbackTitle.trim();
+        String artist = "";
+        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+        try {
+            retriever.setDataSource(file.getAbsolutePath());
+            String metadataTitle = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE);
+            String metadataArtist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST);
+            if (metadataTitle != null && !metadataTitle.trim().isEmpty()) {
+                title = metadataTitle.trim();
+            }
+            if (metadataArtist != null && !metadataArtist.trim().isEmpty()) {
+                artist = metadataArtist.trim();
+            }
+        } catch (Exception ignored) {
+        } finally {
+            try {
+                retriever.release();
+            } catch (Exception ignored) {
+            }
+        }
+        return new String[]{title, artist};
+    }
+
+    private static String cleanDisplayTitle(String value, String source) {
+        String title = value == null ? "Трек" : value.trim();
+        if (source != null && !source.isEmpty() && title.startsWith(source + ": ")) {
+            title = title.substring(source.length() + 2);
+        }
+        int query = title.indexOf('?');
+        if (query > 0) {
+            title = title.substring(0, query);
+        }
+        if (title.length() > 54) {
+            title = title.substring(0, 51) + "…";
+        }
+        return title.isEmpty() ? "Трек" : title;
     }
 }

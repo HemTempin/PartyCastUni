@@ -32,5 +32,14 @@ object YandexQueueAutomation {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)
+        YandexAccessibilityService.kickPendingAction()
+    }
+
+    fun openTrack(context: Context, url: String) {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            setPackage(YANDEX_MUSIC_PACKAGE)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
     }
 }
