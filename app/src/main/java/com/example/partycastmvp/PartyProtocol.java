@@ -25,7 +25,7 @@ public final class PartyProtocol {
 
     public static final int DEFAULT_PORT = 45678;
     public static final int MAGIC = 0x50434153; // PCAS: PartyCast Stream
-    public static final int VERSION = 3;
+    public static final int VERSION = 5;
 
     public static final int TYPE_AUDIO_FILE = 1;
     public static final int TYPE_LINK = 2;
@@ -42,6 +42,7 @@ public final class PartyProtocol {
     public static final String CMD_MOVE_UP = "MOVE_UP";
     public static final String CMD_MOVE_DOWN = "MOVE_DOWN";
     public static final String CMD_REMOVE = "REMOVE";
+    public static final String CMD_REPREPARE = "REPREPARE";
     public static final String CMD_PREVIOUS = "PREVIOUS";
     public static final String CMD_MOVE_TO_PREFIX = "MOVE_TO:";
 
@@ -215,12 +216,20 @@ public final class PartyProtocol {
             String nowArtist = in.readUTF();
             String nowSource = in.readUTF();
             boolean playing = in.readBoolean();
+            int progressMs = version >= 4 ? Math.max(0, in.readInt()) : 0;
+            int durationMs = version >= 4 ? Math.max(0, in.readInt()) : 0;
             int count = Math.max(0, Math.min(in.readInt(), 500));
             List<QueueItemData> items = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                items.add(new QueueItemData(in.readUTF(), in.readUTF(), in.readUTF()));
+                String title = in.readUTF();
+                String artist = in.readUTF();
+                String source = in.readUTF();
+                boolean actionable = version >= 5 ? in.readBoolean() : true;
+                int queueIndex = version >= 5 ? in.readInt() : i;
+                String badge = version >= 5 ? in.readUTF() : "";
+                items.add(new QueueItemData(title, artist, source, actionable, queueIndex, badge));
             }
-            return new QueueSnapshot(responseRoomCode, nowTitle, nowArtist, nowSource, playing, items);
+            return new QueueSnapshot(responseRoomCode, nowTitle, nowArtist, nowSource, playing, progressMs, durationMs, items);
         }
     }
 
@@ -247,11 +256,16 @@ public final class PartyProtocol {
         out.writeUTF(safe.nowArtist);
         out.writeUTF(safe.nowSource);
         out.writeBoolean(safe.playing);
+        out.writeInt(safe.progressMs);
+        out.writeInt(safe.durationMs);
         out.writeInt(safe.items.size());
         for (QueueItemData item : safe.items) {
             out.writeUTF(item.title);
             out.writeUTF(item.artist);
             out.writeUTF(item.source);
+            out.writeBoolean(item.actionable);
+            out.writeInt(item.queueIndex);
+            out.writeUTF(item.badge);
         }
         out.flush();
     }
@@ -429,11 +443,21 @@ public final class PartyProtocol {
         public final String title;
         public final String artist;
         public final String source;
+        public final boolean actionable;
+        public final int queueIndex;
+        public final String badge;
 
         public QueueItemData(String title, String artist, String source) {
+            this(title, artist, source, true, -1, "");
+        }
+
+        public QueueItemData(String title, String artist, String source, boolean actionable, int queueIndex, String badge) {
             this.title = title == null ? "" : title;
             this.artist = artist == null ? "" : artist;
             this.source = source == null ? "" : source;
+            this.actionable = actionable;
+            this.queueIndex = queueIndex;
+            this.badge = badge == null ? "" : badge;
         }
     }
 
@@ -443,19 +467,28 @@ public final class PartyProtocol {
         public final String nowArtist;
         public final String nowSource;
         public final boolean playing;
+        public final int progressMs;
+        public final int durationMs;
         public final List<QueueItemData> items;
 
         public QueueSnapshot(String roomCode, String nowTitle, String nowArtist, String nowSource, boolean playing, List<QueueItemData> items) {
+            this(roomCode, nowTitle, nowArtist, nowSource, playing, 0, 0, items);
+        }
+
+        public QueueSnapshot(String roomCode, String nowTitle, String nowArtist, String nowSource, boolean playing,
+                             int progressMs, int durationMs, List<QueueItemData> items) {
             this.roomCode = normalizeRoomCode(roomCode);
             this.nowTitle = nowTitle == null ? "" : nowTitle;
             this.nowArtist = nowArtist == null ? "" : nowArtist;
             this.nowSource = nowSource == null ? "" : nowSource;
             this.playing = playing;
+            this.progressMs = Math.max(0, progressMs);
+            this.durationMs = Math.max(0, durationMs);
             this.items = Collections.unmodifiableList(new ArrayList<>(items == null ? Collections.emptyList() : items));
         }
 
         public static QueueSnapshot empty(String roomCode) {
-            return new QueueSnapshot(roomCode, "", "", "", false, Collections.emptyList());
+            return new QueueSnapshot(roomCode, "", "", "", false, 0, 0, Collections.emptyList());
         }
     }
 

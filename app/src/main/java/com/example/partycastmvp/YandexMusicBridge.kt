@@ -23,8 +23,57 @@ object YandexMusicBridge {
         fun onLog(message: String)
     }
 
+    fun interface MetadataCallback {
+        fun onResolved(valid: Boolean, title: String, artist: String, normalizedUrl: String, message: String)
+    }
+
+    fun interface AutomationCallback {
+        fun onCompleted(success: Boolean, message: String)
+    }
+
+    @JvmStatic
+    fun isValidTrackLink(rawUrl: String): Boolean = TrackLinkParser.normalizeTrackUrl(rawUrl.trim()) != null
+
+    /** Validates a Yandex Music track URL and resolves its display metadata without opening Yandex Music. */
+    @JvmStatic
+    fun resolveTrackMetadata(rawUrl: String, callback: MetadataCallback) {
+        val originalText = rawUrl.trim()
+        val normalized = TrackLinkParser.normalizeTrackUrl(originalText)
+        if (normalized == null) {
+            callback.onResolved(false, "", "", "", "Ссылка не является ссылкой на трек Яндекс Музыки")
+            return
+        }
+
+        Thread {
+            val trackInfo = try {
+                YandexTrackApiResolver.resolve(normalized)
+                    ?: if (normalized.wasAlbumTrackLink) YandexTrackApiResolver.resolve(normalized.trackId) else null
+            } catch (_: Throwable) {
+                null
+            }
+            val title = trackInfo?.title.orEmpty().ifBlank { "Трек Яндекс Музыки" }
+            val artist = trackInfo?.artists?.joinToString(", ").orEmpty()
+            val message = if (trackInfo == null) {
+                "Метаданные временно недоступны; трек добавлен по проверенной ссылке"
+            } else {
+                "${trackInfo.title} — ${artist.ifBlank { "исполнитель не указан" }}"
+            }
+            callback.onResolved(true, title, artist, normalized.url, message)
+        }.start()
+    }
+
     @JvmStatic
     fun addTrackAsNext(context: Context, rawUrl: String, callback: LogCallback?) {
+        addTrackAsNext(context, rawUrl, callback, null)
+    }
+
+    @JvmStatic
+    fun addTrackAsNext(
+        context: Context,
+        rawUrl: String,
+        callback: LogCallback?,
+        completion: AutomationCallback?
+    ) {
         val appContext = context.applicationContext
         val main = Handler(Looper.getMainLooper())
         val originalText = rawUrl.trim()
@@ -42,6 +91,9 @@ object YandexMusicBridge {
             targetUrl: String = url
         ) {
             try {
+                YandexAccessibilityService.setAutomationCompletionCallback { success, message ->
+                    main.post { completion?.onCompleted(success, message) }
+                }
                 YandexQueueAutomation.addTrackToQueue(
                     context = appContext,
                     url = targetUrl,
@@ -71,12 +123,15 @@ object YandexMusicBridge {
                     }
                 }, if (preferTrackRowMenu) 5200L else 3600L)
             } catch (t: Throwable) {
+                YandexAccessibilityService.setAutomationCompletionCallback(null)
                 log("Я.Музыка: не удалось открыть или автоматизировать добавление — ${t.message ?: t.javaClass.simpleName}")
+                main.post { completion?.onCompleted(false, t.message ?: t.javaClass.simpleName) }
             }
         }
 
         if (url.isBlank()) {
             log("Я.Музыка: пустая ссылка, добавление отменено")
+            main.post { completion?.onCompleted(false, "Пустая ссылка") }
             return
         }
 

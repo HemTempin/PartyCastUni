@@ -20,6 +20,7 @@ object YandexQueueAutomation {
         preferTrackRowMenu: Boolean = false,
         trackInfo: TrackInfo? = null
     ) {
+        YandexAccessibilityService.captureReturnTarget()
         YandexAccessibilityService.pendingAction = YandexAccessibilityService.PendingAction.AddCurrentTrackToQueue(
             expectedTrackId = expectedTrackId,
             openedUrl = url,

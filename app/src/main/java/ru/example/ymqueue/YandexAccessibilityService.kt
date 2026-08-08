@@ -25,6 +25,26 @@ class YandexAccessibilityService : AccessibilityService() {
     private var lastYandexUiEventAt: Long = 0L
     private var scenarioStartedAt: Long = 0L
     private var initialYandexUiSettled: Boolean = false
+    private var readinessSignature: String = ""
+    private var readinessStableChecks: Int = 0
+    private var scenarioStepScheduled: Boolean = false
+    private var scenarioStepAt: Long = 0L
+    private var scheduledAttempt: Int = 0
+
+    private val scenarioStep = Runnable {
+        scenarioStepScheduled = false
+        scenarioStepAt = 0L
+        val action = pendingAction as? PendingAction.AddCurrentTrackToQueue ?: return@Runnable
+        if (!scenarioRunning) return@Runnable
+        attemptAddToQueue(
+            attempt = scheduledAttempt,
+            returnToApp = action.returnToApp,
+            expectedTrackId = action.expectedTrackId,
+            preferTrackRowMenu = action.preferTrackRowMenu,
+            expectedTrackTitle = action.expectedTrackTitle,
+            expectedArtists = action.expectedArtists
+        )
+    }
 
     /**
      * Ğ”Ğ»Ñ album/track ÑÑÑ‹Ğ»Ğ¾Ğº Ğ½ĞµĞ»ÑŒĞ·Ñ Ğ½Ğ°Ğ¶Ğ¸Ğ¼Ğ°Ñ‚ÑŒ Ğ¼ĞµĞ½Ñ ÑˆĞ°Ğ¿ĞºĞ¸ Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼Ğ°: Ğ² ĞºĞ¾Ğ´Ğµ Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞ¸ ÑÑ‚Ğ¾
@@ -35,6 +55,9 @@ class YandexAccessibilityService : AccessibilityService() {
     private var albumTargetRowTapSent = false
     private var albumTargetRowDescription: String = ""
     private var miniPlayerExpanded = false
+    private var lastExternalPackage: String = ""
+    private var lastExternalPackageAt: Long = 0L
+    private var automationReturnPackage: String = ""
 
     sealed class PendingAction {
         data object None : PendingAction()
@@ -45,7 +68,8 @@ class YandexAccessibilityService : AccessibilityService() {
             val openedUrl: String? = null,
             val preferTrackRowMenu: Boolean = false,
             val expectedTrackTitle: String? = null,
-            val expectedArtists: List<String> = emptyList()
+            val expectedArtists: List<String> = emptyList(),
+            val fullRetryCount: Int = 0
         ) : PendingAction()
         data class Diagnostic(
             val createdAt: Long = System.currentTimeMillis()
@@ -55,6 +79,9 @@ class YandexAccessibilityService : AccessibilityService() {
     companion object {
         const val YANDEX_MUSIC_PACKAGE = "ru.yandex.music"
         private const val EXTRA_AUTOMATION_STATUS = "com.example.partycastmvp.EXTRA_AUTOMATION_STATUS"
+        private const val PAGE_READY_POLL_MS = 350L
+        private const val PAGE_READY_TIMEOUT_MS = 25_000L
+        private const val REQUIRED_STABLE_READY_CHECKS = 2
 
         @Volatile
         private var activeService: YandexAccessibilityService? = null
@@ -68,8 +95,19 @@ class YandexAccessibilityService : AccessibilityService() {
         @Volatile
         var lastDiagnosticReport: String = "ĞŸÑ€Ğ¾Ğ²ĞµÑ€ĞºĞ° ĞµÑ‰Ñ‘ Ğ½Ğµ Ğ·Ğ°Ğ¿ÑƒÑĞºĞ°Ğ»Ğ°ÑÑŒ"
 
+        @Volatile
+        private var automationCompletion: ((Boolean, String) -> Unit)? = null
+
+        fun setAutomationCompletionCallback(callback: ((Boolean, String) -> Unit)?) {
+            automationCompletion = callback
+        }
+
         fun kickPendingAction() {
             activeService?.kickPendingActionFromApp()
+        }
+
+        fun captureReturnTarget() {
+            activeService?.captureReturnTargetBeforeAutomation()
         }
 
         fun isScenarioRunning(): Boolean = activeService?.scenarioRunning == true
@@ -110,14 +148,52 @@ class YandexAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString().orEmpty()
-        if (pkg != YANDEX_MUSIC_PACKAGE) return
+        if (pkg != YANDEX_MUSIC_PACKAGE) {
+            rememberExternalPackage(pkg, event?.eventType ?: 0)
+            return
+        }
 
         lastYandexUiEventAt = System.currentTimeMillis()
 
         startPendingScenarioIfNeeded()
+        if (scenarioRunning && !initialYandexUiSettled) {
+            scheduleAttempt(scheduledAttempt, 180L, onlyIfEarlier = true)
+        }
     }
 
     override fun onInterrupt() = Unit
+
+    private fun rememberExternalPackage(pkg: String, eventType: Int) {
+        if (eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        ) return
+        if (!isReturnCandidate(pkg)) return
+        lastExternalPackage = pkg
+        lastExternalPackageAt = System.currentTimeMillis()
+    }
+
+    private fun isReturnCandidate(pkg: String): Boolean {
+        if (pkg.isBlank() || pkg == YANDEX_MUSIC_PACKAGE || pkg == packageName) return false
+        if (pkg.startsWith("com.android.systemui") ||
+            pkg.contains("launcher", ignoreCase = true) ||
+            pkg.contains("permissioncontroller", ignoreCase = true) ||
+            pkg.contains("inputmethod", ignoreCase = true)
+        ) return false
+        return packageManager.getLaunchIntentForPackage(pkg) != null
+    }
+
+    private fun captureReturnTargetBeforeAutomation() {
+        val activePackage = rootInActiveWindow?.packageName?.toString().orEmpty()
+        if (isReturnCandidate(activePackage)) {
+            lastExternalPackage = activePackage
+            lastExternalPackageAt = System.currentTimeMillis()
+        }
+        if (lastExternalPackage.isNotBlank() &&
+            System.currentTimeMillis() - lastExternalPackageAt <= 30 * 60 * 1000L
+        ) {
+            automationReturnPackage = lastExternalPackage
+        }
+    }
 
     override fun onDestroy() {
         if (activeService === this) activeService = null
@@ -144,24 +220,11 @@ class YandexAccessibilityService : AccessibilityService() {
 
         scenarioRunning = true
         scenarioStartedAt = System.currentTimeMillis()
-        initialYandexUiSettled = false
-        albumSafeRowMenuGestureSent = false
-        albumTargetRowTapSent = false
-        albumTargetRowDescription = ""
-        miniPlayerExpanded = false
+        resetAutomationCycleState()
         handler.removeCallbacksAndMessages(null)
         // Ğ”Ğ°Ñ‘Ğ¼ Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞµ Ğ·Ğ°ĞºĞ¾Ğ½Ñ‡Ğ¸Ñ‚ÑŒ Ğ¾Ñ‚ĞºÑ€Ñ‹Ñ‚Ğ¸Ğµ ÑÑÑ‹Ğ»ĞºĞ¸/Ğ°Ğ½Ğ¸Ğ¼Ğ°Ñ†Ğ¸Ñ. Ğ¡Ñ†ĞµĞ½Ğ°Ñ€Ğ¸Ğ¹ Ğ·Ğ°Ğ¿ÑƒÑĞºĞ°ĞµÑ‚ÑÑ ĞºĞ°Ğº
         // Ğ¾Ñ‚ Accessibility-ÑĞ¾Ğ±Ñ‹Ñ‚Ğ¸Ñ, Ñ‚Ğ°Ğº Ğ¸ Ğ¾Ñ‚ ÑĞ²Ğ½Ğ¾Ğ³Ğ¾ ÑĞ¸Ğ³Ğ½Ğ°Ğ»Ğ° PartyCast.
-        handler.postDelayed({
-            attemptAddToQueue(
-                attempt = 0,
-                returnToApp = action.returnToApp,
-                expectedTrackId = action.expectedTrackId,
-                preferTrackRowMenu = action.preferTrackRowMenu,
-                expectedTrackTitle = action.expectedTrackTitle,
-                expectedArtists = action.expectedArtists
-            )
-        }, if (action.preferTrackRowMenu) 1700 else 1200)
+        scheduleAttempt(0, 250L)
     }
 
     private fun runDiagnosticAttempt(action: PendingAction.Diagnostic, attempt: Int) {
@@ -217,17 +280,47 @@ class YandexAccessibilityService : AccessibilityService() {
         expectedTrackTitle: String? = null,
         expectedArtists: List<String> = emptyList()
     ) {
-        val root = rootInActiveWindow
-        if (root == null) {
-            retryOrFail(attempt, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists, "ĞĞµ Ğ²Ğ¸Ğ¶Ñƒ Ğ¾ĞºĞ½Ğ¾ Ğ¯Ğ½Ğ´ĞµĞºÑ ĞœÑƒĞ·Ñ‹ĞºĞ¸")
+        val elapsed = System.currentTimeMillis() - scenarioStartedAt
+        if (!initialYandexUiSettled && elapsed >= PAGE_READY_TIMEOUT_MS) {
+            retryWholeScenarioOrFail(
+                "Ğ¯Ğ½Ğ´ĞµĞºÑ ĞœÑƒĞ·Ñ‹ĞºĞ° Ğ½Ğµ Ğ¿Ğ¾ĞºĞ°Ğ·Ğ°Ğ»Ğ° ÑÑ‚Ñ€Ğ°Ğ½Ğ¸Ñ†Ñƒ Ğ¾Ğ¶Ğ¸Ğ´Ğ°ĞµĞ¼Ğ¾Ğ³Ğ¾ Ñ‚Ñ€ĞµĞºĞ° Ğ·Ğ° ${PAGE_READY_TIMEOUT_MS / 1000} ÑĞµĞºÑƒĞ½Ğ´"
+            )
             return
         }
 
-        if (!initialYandexUiSettled && shouldWaitForInitialYandexUiSettle(preferTrackRowMenu)) {
-            handler.postDelayed({ attemptAddToQueue(attempt, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists) }, 300)
+        val root = rootInActiveWindow
+        if (root == null || root.packageName?.toString() != YANDEX_MUSIC_PACKAGE) {
+            scheduleAttempt(attempt, PAGE_READY_POLL_MS)
             return
         }
-        initialYandexUiSettled = true
+
+        if (!initialYandexUiSettled) {
+            val signature = expectedTrackReadinessSignature(
+                root,
+                preferTrackRowMenu,
+                expectedTrackTitle,
+                expectedArtists
+            )
+            if (signature == null) {
+                readinessSignature = ""
+                readinessStableChecks = 0
+                updateHierarchyDump(root)
+                scheduleAttempt(attempt, PAGE_READY_POLL_MS)
+                return
+            }
+
+            if (signature == readinessSignature) {
+                readinessStableChecks++
+            } else {
+                readinessSignature = signature
+                readinessStableChecks = 1
+            }
+            if (readinessStableChecks < REQUIRED_STABLE_READY_CHECKS) {
+                scheduleAttempt(attempt, PAGE_READY_POLL_MS)
+                return
+            }
+            initialYandexUiSettled = true
+        }
 
         updateHierarchyDump(root)
 
@@ -235,1117 +328,11 @@ class YandexAccessibilityService : AccessibilityService() {
         // Ñ‚Ñ€ĞµĞº Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ Ğ² Ğ¼Ğ¸Ğ½Ğ¸-Ğ¿Ğ»ĞµĞµÑ€Ğµ. Ğ’ ÑÑ‚Ğ¾Ğ¼ ÑĞ»ÑƒÑ‡Ğ°Ğµ ÑĞ½Ğ°Ñ‡Ğ°Ğ»Ğ° Ñ€Ğ°ÑĞºÑ€Ñ‹Ğ²Ğ°ĞµĞ¼ Ğ¼Ğ¸Ğ½Ğ¸-Ğ¿Ğ»ĞµĞµÑ€.
         if (!miniPlayerExpanded && expandExpectedTrackMiniPlayer(root, expectedTrackTitle)) {
             miniPlayerExpanded = true
-            handler.postDelayed({
-                attemptAddToQueue(0, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists)
-            }, 900)
+            scheduleAttempt(0, 900L)
             return
         }
 
         // Ğ”Ğ»Ñ Ğ¾Ğ±Ñ‹Ñ‡Ğ½Ñ‹Ñ… ÑÑÑ‹Ğ»Ğ¾Ğº Ğ¾ÑÑ‚Ğ°Ğ²Ğ»ÑĞµĞ¼ Ñ€Ğ°Ğ±Ğ¾Ñ‡ÑƒÑ Ğ»Ğ¾Ğ³Ğ¸ĞºÑƒ fixed5.
         // Ğ”Ğ»Ñ album/track ÑÑÑ‹Ğ»Ğ¾Ğº ĞĞ• Ğ½Ğ°Ğ¶Ğ¸Ğ¼Ğ°ĞµĞ¼ AddNext Ğ´Ğ¾ Ğ¿Ğ¾Ğ¿Ñ‹Ñ‚ĞºĞ¸ Ğ¾Ñ‚ĞºÑ€Ñ‹Ñ‚ÑŒ Ğ¼ĞµĞ½Ñ ÑÑ‚Ñ€Ğ¾ĞºĞ¸ Ñ‚Ñ€ĞµĞºĞ°,
         // Ñ‡Ñ‚Ğ¾Ğ±Ñ‹ Ğ½Ğµ Ğ¿Ñ€Ğ¸Ğ¼ĞµĞ½Ğ¸Ñ‚ÑŒ ĞºĞ¾Ğ¼Ğ°Ğ½Ğ´Ñƒ Ğº Ğ¼ĞµĞ½Ñ Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼Ğ°.
-        val albumRowMode = preferTrackRowMenu && !miniPlayerExpanded
-        val canClickAddNextNow = !albumRowMode || albumSafeRowMenuGestureSent || albumTargetRowTapSent
-        if (canClickAddNextNow && clickAddNextMenuItem(root)) {
-            val idSuffix = expectedTrackId?.let { " (trackId=$it)" }.orEmpty()
-            finishScenario(success = true, returnToApp = returnToApp, message = "ĞĞ°Ğ¶Ğ°Ğ» Ğ¿ÑƒĞ½ĞºÑ‚ Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ĞµĞ½Ğ¸Ñ Ñ‚Ñ€ĞµĞºĞ° ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼$idSuffix")
-            return
-        }
-
-        // ĞšÑ€Ğ¸Ñ‚Ğ¸Ñ‡Ğ½Ğ°Ñ Ğ¿Ñ€Ğ°Ğ²ĞºĞ°: Ñ€Ğ°Ğ½ÑŒÑˆĞµ ÑĞµÑ€Ğ²Ğ¸Ñ Ğ²Ğ¸Ğ´ĞµĞ» scrollable album page ĞºĞ°Ğº Ğ¼ĞµĞ½Ñ Ğ¸ ÑÑ€Ğ°Ğ·Ñƒ
-        // Ğ¿Ñ€Ğ¾ĞºÑ€ÑƒÑ‡Ğ¸Ğ²Ğ°Ğ» Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼ Ğ² ÑĞ°Ğ¼Ñ‹Ğ¹ Ğ½Ğ¸Ğ·, Ğ¿Ğ¾Ğ¿Ğ°Ğ´Ğ°Ñ Ğ² Ñ€ĞµĞºĞ¾Ğ¼ĞµĞ½Ğ´Ğ°Ñ†Ğ¸Ğ¸. Ğ¢ĞµĞ¿ĞµÑ€ÑŒ Ğ¿Ñ€Ğ¾ĞºÑ€ÑƒÑ‚ĞºĞ° Ñ€Ğ°Ğ·Ñ€ĞµÑˆĞµĞ½Ğ°
-        // Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ Ğ´Ğ»Ñ Ğ¾Ğ±Ñ‹Ñ‡Ğ½Ğ¾Ğ³Ğ¾ Ñ€ĞµĞ¶Ğ¸Ğ¼Ğ° Ğ¸ Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ ĞµÑĞ»Ğ¸ ÑĞºÑ€Ğ°Ğ½ Ğ´ĞµĞ¹ÑÑ‚Ğ²Ğ¸Ñ‚ĞµĞ»ÑŒĞ½Ğ¾ Ğ¿Ğ¾Ñ…Ğ¾Ğ¶ Ğ½Ğ° bottom-sheet Ğ¼ĞµĞ½Ñ.
-        val rowMenuAlreadyOpened = albumSafeRowMenuGestureSent || albumTargetRowTapSent
-        if ((!albumRowMode || rowMenuAlreadyOpened) && looksLikeContextMenuOpen(root) && scrollLikelyMenu(root)) {
-            handler.postDelayed({ attemptAddToQueue(attempt + 1, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists) }, 450)
-            return
-        }
-
-        val menuOpened = if (albumRowMode) {
-            openAlbumTrackRowMenuAttempt(root, attempt, expectedTrackTitle, expectedArtists)
-        } else {
-            openGenericTrackMenuAttempt(root, attempt)
-        }
-
-        if (menuOpened) {
-            if (albumRowMode) albumSafeRowMenuGestureSent = true
-            handler.postDelayed({ attemptAddToQueue(attempt + 1, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists) }, 800)
-        } else {
-            retryOrFail(attempt, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists, "ĞĞµ ÑƒĞ´Ğ°Ğ»Ğ¾ÑÑŒ Ğ¾Ñ‚ĞºÑ€Ñ‹Ñ‚ÑŒ Ğ¼ĞµĞ½Ñ Ñ‚Ñ€ĞµĞºĞ°")
-        }
-    }
-
-    private fun retryOrFail(
-        attempt: Int,
-        returnToApp: Boolean,
-        expectedTrackId: String?,
-        preferTrackRowMenu: Boolean,
-        expectedTrackTitle: String? = null,
-        expectedArtists: List<String> = emptyList(),
-        reason: String
-    ) {
-        val albumRowMode = preferTrackRowMenu && !miniPlayerExpanded
-        val maxAttempts = if (albumRowMode) 2 else 8
-        val shouldStopAfterSingleAlbumRowTap = albumRowMode && albumTargetRowTapSent
-        if (attempt < maxAttempts && !shouldStopAfterSingleAlbumRowTap) {
-            handler.postDelayed({ attemptAddToQueue(attempt + 1, returnToApp, expectedTrackId, preferTrackRowMenu, expectedTrackTitle, expectedArtists) }, 650)
-        } else {
-            val safetyNote = if (albumRowMode) {
-                val targetInfo = if (albumTargetRowDescription.isNotBlank()) "\nĞŸĞ¾ÑĞ»ĞµĞ´Ğ½ÑÑ Ğ²Ñ‹Ğ±Ñ€Ğ°Ğ½Ğ½Ğ°Ñ ÑÑ‚Ñ€Ğ¾ĞºĞ°: $albumTargetRowDescription" else ""
-                val apiInfo = expectedTrackTitle?.let { title ->
-                    val artists = expectedArtists.joinToString(", ").ifBlank { "Ğ±ĞµĞ· Ğ°Ñ€Ñ‚Ğ¸ÑÑ‚Ğ°" }
-                    "\nĞ˜ÑĞºĞ°Ğ»Ğ¸ Ğ¿Ğ¾ API: $title â€” $artists"
-                }.orEmpty()
-                "\n\nĞ‘ĞµĞ·Ğ¾Ğ¿Ğ°ÑĞ½Ñ‹Ğ¹ album/track Ñ€ĞµĞ¶Ğ¸Ğ¼ Ğ¾ÑÑ‚Ğ°Ğ½Ğ¾Ğ²Ğ¸Ğ»ÑÑ: Ğ¿Ñ€Ğ¸Ğ»Ğ¾Ğ¶ĞµĞ½Ğ¸Ğµ Ğ¸Ñ‰ĞµÑ‚ ÑÑ‚Ñ€Ğ¾ĞºÑƒ Ğ¿Ğ¾ title Ğ¸Ğ· API Ğ¸ Ğ½Ğµ Ğ¿ĞµÑ€ĞµĞ±Ğ¸Ñ€Ğ°ĞµÑ‚ ÑĞ¾ÑĞµĞ´Ğ½Ğ¸Ğµ ÑÑ‚Ñ€Ğ¾ĞºĞ¸. Artist-Ñ„Ğ¸Ğ»ÑŒÑ‚Ñ€ ÑĞµĞ¹Ñ‡Ğ°Ñ Ğ¾Ñ‚ĞºĞ»ÑÑ‡Ñ‘Ğ½.$apiInfo$targetInfo"
-            } else ""
-            val diagnostic = if (lastHierarchyDump.isBlank()) {
-                reason + safetyNote
-            } else {
-                "$reason$safetyNote\n\nĞŸĞ¾ÑĞ»ĞµĞ´Ğ½Ğ¸Ğµ Ğ²Ğ¸Ğ´Ğ¸Ğ¼Ñ‹Ğµ ÑĞ»ĞµĞ¼ĞµĞ½Ñ‚Ñ‹ Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞ¸:\n$lastHierarchyDump"
-            }
-            finishScenario(success = false, returnToApp = returnToApp, message = diagnostic)
-        }
-    }
-
-    private fun expandExpectedTrackMiniPlayer(
-        root: AccessibilityNodeInfo,
-        expectedTrackTitle: String?
-    ): Boolean {
-        val expected = expectedTrackTitle?.normalizeYm()?.stripExplicitTrackMarkers().orEmpty()
-        if (expected.isBlank()) return false
-
-        val screenHeight = resources.displayMetrics.heightPixels
-        val minY = (screenHeight * 0.76f).toInt()
-        val maxY = (screenHeight * 0.93f).toInt()
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val candidates = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            val bounds = boundsOf(node)
-            if (bounds.centerY() !in minY..maxY) return@mapNotNull null
-            val label = labelOf(node).normalizeYm().stripExplicitTrackMarkers()
-            if (label.isBlank()) return@mapNotNull null
-            val titleMatches = label == expected ||
-                (label.contains(expected) && label.length <= expected.length + 48) ||
-                (expected.contains(label) && label.length >= 4)
-            if (!titleMatches) return@mapNotNull null
-
-            val clickable = (if (node.isClickable) node else clickableParent(node))?.takeIf {
-                val parentBounds = boundsOf(it)
-                parentBounds.centerY() in minY..maxY && parentBounds.height() <= dp(190)
-            }
-            val targetBounds = clickable?.let { boundsOf(it) } ?: bounds
-            var score = 100
-            if (label == expected) score += 80
-            if (clickable != null) score += 50
-            if (targetBounds.width() > resources.displayMetrics.widthPixels * 0.35f) score += 25
-            Candidate(clickable ?: node, targetBounds, score, label)
-        }.sortedByDescending { it.score }
-
-        val target = candidates.firstOrNull() ?: return false
-        albumTargetRowDescription = "Ğ¼Ğ¸Ğ½Ğ¸-Ğ¿Ğ»ĞµĞµÑ€: ${target.label.take(80)} ${target.bounds}"
-        if (target.node.isClickable && target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-            return true
-        }
-        return tap(target.bounds.centerX(), target.bounds.centerY())
-    }
-
-    private fun openGenericTrackMenuAttempt(root: AccessibilityNodeInfo, attempt: Int): Boolean = when (attempt) {
-        0 -> clickTrackContextMenuBySemantics(root)
-        1 -> clickTrackContextMenuByScore(root)
-        2 -> tapTopRightOverflow()
-        3 -> tapUpperRightOverflow()
-        4 -> tapMiddleRightOverflow()
-        5 -> longPressLikelyTrackArea()
-        6 -> tapLowerRightOverflow()
-        else -> false
-    }
-
-    private fun openAlbumTrackRowMenuAttempt(
-        root: AccessibilityNodeInfo,
-        attempt: Int,
-        expectedTrackTitle: String?,
-        expectedArtists: List<String>
-    ): Boolean = when (attempt) {
-        /*
-         * Album/track Ñ€ĞµĞ¶Ğ¸Ğ¼ Ğ±Ğ¾Ğ»ÑŒÑˆĞµ Ğ½Ğµ ĞºĞ»Ğ¸ĞºĞ°ĞµÑ‚ Ğ¿Ğ¾ "ÑÑ‚Ñ€Ğ¾ĞºĞµ" ĞºĞ°Ğº Ğ¿Ğ¾ ÑˆĞ¸Ñ€Ğ¾ĞºĞ¾Ğ¼Ñƒ ĞºĞ¾Ğ½Ñ‚ĞµĞ¹Ğ½ĞµÑ€Ñƒ.
-         * Ğ’ fixed11 Ğ¸Ğ¼ĞµĞ½Ğ½Ğ¾ ÑÑ‚Ğ¾ ÑĞ´Ğ²Ğ¸Ğ³Ğ°Ğ»Ğ¾ ĞºĞ¾Ğ¾Ñ€Ğ´Ğ¸Ğ½Ğ°Ñ‚Ñƒ Ğ²Ğ½Ğ¸Ğ· Ğ¸ Ğ¾Ñ‚ĞºÑ€Ñ‹Ğ²Ğ°Ğ»Ğ¾ Ğ¼ĞµĞ½Ñ ÑĞ»ĞµĞ´ÑƒÑÑ‰ĞµĞ³Ğ¾ Ñ‚Ñ€ĞµĞºĞ°.
-         * Ğ¢ĞµĞ¿ĞµÑ€ÑŒ ÑĞ½Ğ°Ñ‡Ğ°Ğ»Ğ° Ğ¸Ñ‰ĞµĞ¼ ÑĞ²Ğ½ÑƒÑ Ğ¼Ğ°Ğ»ĞµĞ½ÑŒĞºÑƒÑ ĞºĞ½Ğ¾Ğ¿ĞºÑƒ ÑĞ¿Ñ€Ğ°Ğ²Ğ° Ğ½Ğ° Ñ‚Ğ¾Ğ¹ Ğ¶Ğµ Y-ĞºĞ¾Ğ¾Ñ€Ğ´Ğ¸Ğ½Ğ°Ñ‚Ğµ, Ñ‡Ñ‚Ğ¾ Ğ¸
-         * Ñ‚ĞµĞºÑÑ‚ Ğ½ÑƒĞ¶Ğ½Ğ¾Ğ¹ ÑÑ‚Ñ€Ğ¾ĞºĞ¸ Ğ¿Ğ¾ÑĞ»Ğµ fragment_container_view. Ğ•ÑĞ»Ğ¸ ĞºĞ½Ğ¾Ğ¿ĞºĞ° Ğ½Ğµ Ğ²Ğ¸Ğ´Ğ½Ğ°
-         * Accessibility API, Ğ´ĞµĞ»Ğ°ĞµĞ¼ Ğ¾Ğ´Ğ¸Ğ½ fallback-tap ÑÑ‚Ñ€Ğ¾Ğ³Ğ¾ Ğ½Ğ° Ğ²Ñ‹ÑĞ¾Ñ‚Ğµ Ñ‚ĞµĞºÑÑ‚Ğ° ÑÑ‚Ğ¾Ğ¹ ÑÑ‚Ñ€Ğ¾ĞºĞ¸.
-         */
-        0 -> clickAlbumTargetOverflowByExplicitButton(root, expectedTrackTitle, expectedArtists)
-        1 -> if (!albumTargetRowTapSent) tapAlbumTargetOverflowByExactTextLine(root, expectedTrackTitle, expectedArtists) else false
-        else -> false
-    }
-
-    private fun finishScenario(success: Boolean, returnToApp: Boolean, message: String) {
-        lastDiagnosticReport = (if (success) "ĞĞ’Ğ¢ĞĞœĞĞ¢Ğ˜Ğ—ĞĞ¦Ğ˜Ğ¯: ÑƒÑĞ¿ĞµÑˆĞ½Ğ¾\n" else "ĞĞ’Ğ¢ĞĞœĞĞ¢Ğ˜Ğ—ĞĞ¦Ğ˜Ğ¯: Ğ¾ÑˆĞ¸Ğ±ĞºĞ°\n") + message
-        pendingAction = PendingAction.None
-        scenarioRunning = false
-        scenarioStartedAt = 0L
-        initialYandexUiSettled = false
-        albumSafeRowMenuGestureSent = false
-        albumTargetRowTapSent = false
-        albumTargetRowDescription = ""
-        miniPlayerExpanded = false
-        handler.removeCallbacksAndMessages(null)
-
-        Toast.makeText(
-            applicationContext,
-            if (success) "PartyCast: Ñ‚Ñ€ĞµĞº Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ĞµĞ½ ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼" else "PartyCast: Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒ Ñ‚Ñ€ĞµĞº Ğ½Ğµ ÑƒĞ´Ğ°Ğ»Ğ¾ÑÑŒ â€” Ğ¾Ñ‚Ñ‡Ñ‘Ñ‚ ÑĞ¾Ñ…Ñ€Ğ°Ğ½Ñ‘Ğ½ Ğ² Ñ‚ĞµÑ…Ğ½Ğ¸Ñ‡ĞµÑĞºĞ¸Ñ… Ğ½Ğ°ÑÑ‚Ñ€Ğ¾Ğ¹ĞºĞ°Ñ…",
-            Toast.LENGTH_LONG
-        ).show()
-
-        if (success) {
-            // Ğ—Ğ°ĞºÑ€Ñ‹Ğ²Ğ°ĞµĞ¼ bottom-sheet/ĞºĞ¾Ğ½Ñ‚ĞµĞºÑÑ‚Ğ½Ğ¾Ğµ Ğ¼ĞµĞ½Ñ, Ğ½Ğµ Ğ¾ÑÑ‚Ğ°Ğ½Ğ°Ğ²Ğ»Ğ¸Ğ²Ğ°Ñ Ğ²Ğ¾ÑĞ¿Ñ€Ğ¾Ğ¸Ğ·Ğ²ĞµĞ´ĞµĞ½Ğ¸Ğµ.
-            handler.postDelayed({ performGlobalAction(GLOBAL_ACTION_BACK) }, 450)
-        }
-
-        if (returnToApp) {
-            handler.postDelayed({ openOwnApp(message) }, if (success) 950 else 250)
-        } else {
-            // Leave Yandex Music through Android's task history. This returns to the app that was
-            // in the foreground before the deep link instead of forcing PartyCast to the front.
-            handler.postDelayed({ performGlobalAction(GLOBAL_ACTION_BACK) }, if (success) 950 else 250)
-        }
-    }
-
-    private fun openOwnApp(message: String) {
-        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-        val intent = (launchIntent ?: Intent()).apply {
-            if (launchIntent == null) {
-                setClassName(packageName, "$packageName.MainActivity")
-            }
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            putExtra(EXTRA_AUTOMATION_STATUS, message)
-        }
-        startActivity(intent)
-    }
-
-    private fun shouldWaitForInitialYandexUiSettle(preferTrackRowMenu: Boolean): Boolean {
-        val now = System.currentTimeMillis()
-        val quietMs = if (preferTrackRowMenu) 900L else 550L
-        val minWaitMs = if (preferTrackRowMenu) 1700L else 1000L
-        val maxWaitMs = if (preferTrackRowMenu) 5200L else 3200L
-
-        val age = now - scenarioStartedAt
-        if (age >= maxWaitMs) return false
-        if (age < minWaitMs) return true
-
-        return now - lastYandexUiEventAt < quietMs
-    }
-
-    /**
-     * Ğ’Ğ½ÑƒÑ‚Ñ€Ğ¸ Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞ¸ Ğ¼Ñ‹ Ğ²Ğ¸Ğ´ĞµĞ»Ğ¸ ĞºĞ¾Ğ¼Ğ°Ğ½Ğ´Ñ‹ AddPlayablesAsNextCommand / YnisonEditQueueCommand.AddNext.
-     * Ğ’ UI ÑÑ‚Ğ¾ Ğ¾Ğ±Ñ‹Ñ‡Ğ½Ğ¾ Ğ½Ğ°Ğ·Ñ‹Ğ²Ğ°ĞµÑ‚ÑÑ Ğ½Ğµ Ñ‚ĞµÑ…Ğ½Ğ¸Ñ‡ĞµÑĞºĞ¸ AddNext, Ğ° "Ğ¡Ğ»ÑƒÑˆĞ°Ñ‚ÑŒ ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼", "Ğ˜Ğ³Ñ€Ğ°Ñ‚ÑŒ ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼",
-     * "Ğ”Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒ Ğ² Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ" Ğ¸ Ğ¿Ğ¾Ñ…Ğ¾Ğ¶Ğ¸Ğ¼Ğ¸ Ñ„Ñ€Ğ°Ğ·Ğ°Ğ¼Ğ¸.
-     */
-    private fun clickAddNextMenuItem(root: AccessibilityNodeInfo): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val scored = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            val label = labelWithChildren(node).normalizeYm()
-            if (label.isBlank()) return@mapNotNull null
-            val clickable = if (node.isClickable) node else clickableParent(node)
-            if (clickable == null) return@mapNotNull null
-
-            /*
-             * Ğ’Ğ°Ğ¶Ğ½Ğ¾: Ğ² Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞµ "Ğ”Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒ Ğ² Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ" Ğ½Ğ° Ñ‚Ğ²Ğ¾ĞµĞ¹ Ğ²ĞµÑ€ÑĞ¸Ğ¸ ÑƒĞ²Ğ¾Ğ´Ğ¸Ñ‚ Ñ‚Ñ€ĞµĞº
-             * Ğ² ĞºĞ¾Ğ½ĞµÑ† Ğ¾Ñ‡ĞµÑ€ĞµĞ´Ğ¸. ĞĞ°Ğ¼ Ğ½ÑƒĞ¶Ğ½Ğ° Ğ¸Ğ¼ĞµĞ½Ğ½Ğ¾ Ğ²Ğ½ÑƒÑ‚Ñ€ĞµĞ½Ğ½ÑÑ Ğ»Ğ¾Ğ³Ğ¸ĞºĞ° AddNext / PlayNext,
-             * ĞºĞ¾Ñ‚Ğ¾Ñ€ÑƒÑ Ğ² UI Ğ½Ğ°Ğ·Ñ‹Ğ²Ğ°ÑÑ‚ "Ğ¡Ğ»ÑƒÑˆĞ°Ñ‚ÑŒ ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼", "Ğ˜Ğ³Ñ€Ğ°Ñ‚ÑŒ ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼" Ğ¸ Ñ‚.Ğ¿.
-             * ĞŸĞ¾ÑÑ‚Ğ¾Ğ¼Ñƒ Ğ±Ğ¾Ğ»ÑŒÑˆĞµ Ğ½Ğµ ĞºĞ»Ğ¸ĞºĞ°ĞµĞ¼ generic "Ğ”Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒ Ğ² Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ", ĞµÑĞ»Ğ¸ Ğ² Ñ‚ĞµĞºÑÑ‚Ğµ
-             * Ğ½ĞµÑ‚ ÑĞ²Ğ½Ğ¾Ğ³Ğ¾ Ğ¿Ñ€Ğ¸Ğ·Ğ½Ğ°ĞºĞ° "ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼/Ğ´Ğ°Ğ»ĞµĞµ/next".
-             */
-            var score = 0
-            var hasNextIntent = false
-
-            fun next(points: Int) {
-                score += points
-                hasNextIntent = true
-            }
-
-            if (label.contains("ÑĞ»ÑƒÑˆĞ°Ñ‚ÑŒÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼")) next(180)
-            if (label.contains("Ğ¸Ğ³Ñ€Ğ°Ñ‚ÑŒÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼")) next(180)
-            if (label.contains("Ğ²Ğ¾ÑĞ¿Ñ€Ğ¾Ğ¸Ğ·Ğ²ĞµÑÑ‚Ğ¸ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼")) next(180)
-            if (label.contains("Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼")) next(170)
-            if (label.contains("ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼Ğ²Ğ¾Ñ‡ĞµÑ€ĞµĞ´Ğ¸")) next(170)
-            if (label.contains("ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ°ÑĞ²Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ")) next(160)
-            if (label.contains("Ğ¿Ğ¾ÑĞ»ĞµÑ‚ĞµĞºÑƒÑ‰ĞµĞ³Ğ¾")) next(150)
-            if (label.contains("ÑĞ»ÑƒÑˆĞ°Ñ‚ÑŒĞ´Ğ°Ğ»ĞµĞµ")) next(145)
-            if (label.contains("Ğ¸Ğ³Ñ€Ğ°Ñ‚ÑŒĞ´Ğ°Ğ»ĞµĞµ")) next(145)
-            if (label.contains("ÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼")) next(95)
-
-            if (label.contains("playnext")) next(180)
-            if (label.contains("addnext")) next(170)
-            if (label.contains("addasnext")) next(170)
-            if (label.contains("listennext")) next(160)
-            if (label.contains("nextinqueue")) next(155)
-
-            // Ğ­Ñ‚Ğ¸ Ğ¿ÑƒĞ½ĞºÑ‚Ñ‹ Ğ¿Ğ¾Ñ…Ğ¾Ğ¶Ğ¸ Ğ¿Ğ¾ ÑĞ¼Ñ‹ÑĞ»Ñƒ, Ğ½Ğ¾ Ğ½Ğ° Ğ¿Ñ€Ğ°ĞºÑ‚Ğ¸ĞºĞµ Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ÑÑÑ‚ Ğ² ĞºĞ¾Ğ½ĞµÑ† Ğ¾Ñ‡ĞµÑ€ĞµĞ´Ğ¸.
-            if (label.contains("Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒĞ²Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ") && !hasNextIntent) score -= 220
-            if (label.contains("Ğ²Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ") && !hasNextIntent) score -= 180
-            if (label.contains("addtoqueue") && !hasNextIntent) score -= 220
-            if (label.contains("queue") && !hasNextIntent) score -= 140
-            if (label.contains("playlast") || label.contains("addlast") || label.contains("ÑĞ»ÑƒÑˆĞ°Ñ‚ÑŒĞ¿Ğ¾ÑĞ»ĞµĞ´Ğ½Ğ¸Ğ¼")) score -= 260
-
-            if (label.contains("Ğ¿ĞµÑ€ĞµĞ¹Ñ‚Ğ¸ĞºĞ¾Ñ‡ĞµÑ€ĞµĞ´Ğ¸") || label.contains("Ğ¾Ñ‚ĞºÑ€Ñ‹Ñ‚ÑŒĞ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ")) score -= 180
-            if (label.contains("Ğ¿Ğ¾Ğ´ĞµĞ»Ğ¸Ñ‚ÑŒÑÑ") || label.contains("share")) score -= 120
-            if (label.contains("Ğ¿Ğ»ĞµĞ¹Ğ»Ğ¸ÑÑ‚") || label.contains("playlist")) score -= 60
-            if (label.contains("Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼") || label.contains("album")) score -= 40
-            if (label.contains("Ğ¸ÑĞ¿Ğ¾Ğ»Ğ½Ğ¸Ñ‚ĞµĞ»ÑŒ") || label.contains("artist")) score -= 40
-            if (label.contains("ÑĞºĞ°Ñ‡Ğ°Ñ‚ÑŒ") || label.contains("download")) score -= 40
-
-            if (hasNextIntent && score > 0) Candidate(clickable, boundsOf(clickable), score, label) else null
-        }.sortedByDescending { it.score }
-
-        val target = scored.firstOrNull() ?: return false
-        return target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-    }
-
-    private fun looksLikeContextMenuOpen(root: AccessibilityNodeInfo): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-        val h = resources.displayMetrics.heightPixels
-        var menuSignals = 0
-        all.forEach { node ->
-            if (!node.isVisibleToUser) return@forEach
-            val r = boundsOf(node)
-            if (r.centerY() < h * 0.35) return@forEach
-            val label = labelWithChildren(node).normalizeYm()
-            if (label.contains("ÑĞ»ÑƒÑˆĞ°Ñ‚ÑŒÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼") || label.contains("Ğ¸Ğ³Ñ€Ğ°Ñ‚ÑŒÑĞ»ĞµĞ´ÑƒÑÑ‰Ğ¸Ğ¼") || label.contains("Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒĞ²Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ")) menuSignals += 3
-            if (label.contains("Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒĞ²Ğ¿Ğ»ĞµĞ¹Ğ»Ğ¸ÑÑ‚") || label.contains("Ğ¿Ğ¾Ğ´ĞµĞ»Ğ¸Ñ‚ÑŒÑÑ") || label.contains("Ğ¿ĞµÑ€ĞµĞ¹Ñ‚Ğ¸ĞºĞ¸ÑĞ¿Ğ¾Ğ»Ğ½Ğ¸Ñ‚ĞµĞ»Ñ")) menuSignals += 1
-            if (label.contains("Ñ‚ĞµĞºÑÑ‚Ğ¿ĞµÑĞ½Ğ¸") || label.contains("ÑĞºĞ°Ñ‡Ğ°Ñ‚ÑŒ") || label.contains("Ñ€Ğ°Ğ´Ğ¸Ğ¾Ğ¿Ğ¾Ñ‚Ñ€ĞµĞºÑƒ")) menuSignals += 1
-        }
-        return menuSignals >= 3
-    }
-
-    private fun scrollLikelyMenu(root: AccessibilityNodeInfo): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-        val screenHeight = resources.displayMetrics.heightPixels
-        val scrollable = all.firstOrNull { node ->
-            if (!node.isVisibleToUser || !node.isScrollable) return@firstOrNull false
-            val r = boundsOf(node)
-            // Ğ¢Ğ¾Ğ»ÑŒĞºĞ¾ bottom-sheet/Ğ¼ĞµĞ½Ñ, Ğ½Ğµ Ğ¾ÑĞ½Ğ¾Ğ²Ğ½Ğ°Ñ ÑÑ‚Ñ€Ğ°Ğ½Ğ¸Ñ†Ğ° Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼Ğ°.
-            r.top > screenHeight * 0.25 && r.bottom > screenHeight * 0.70
-        } ?: return false
-        return scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
-    }
-
-
-    /**
-     * Album/track ÑÑ‚Ğ°Ğ±Ğ¸Ğ»ÑŒĞ½Ñ‹Ğ¹ Ñ€ĞµĞ¶Ğ¸Ğ¼: Ğ¸Ñ‰ĞµĞ¼ ĞºĞ¾Ğ½ĞºÑ€ĞµÑ‚Ğ½Ñ‹Ğ¹ title, Ğ¿Ğ¾Ğ»ÑƒÑ‡ĞµĞ½Ğ½Ñ‹Ğ¹ Ñ‡ĞµÑ€ĞµĞ· API,
-     * Ğ° Ğ½Ğµ Ğ¿ĞµÑ€Ğ²ÑƒÑ/Ğ²Ñ‚Ğ¾Ñ€ÑƒÑ ÑÑ‚Ñ€Ğ¾ĞºÑƒ Ğ¿Ğ¾ÑĞ»Ğµ fragment_container_view. Ğ•ÑĞ»Ğ¸ ĞµÑÑ‚ÑŒ anchor
-     * fragment_container_view, Ñ€Ğ°ÑÑĞ¼Ğ°Ñ‚Ñ€Ğ¸Ğ²Ğ°ĞµĞ¼ Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ ÑĞ»ĞµĞ¼ĞµĞ½Ñ‚Ñ‹ Ğ¿Ğ¾ÑĞ»Ğµ Ğ½ĞµĞ³Ğ¾, Ñ‡Ñ‚Ğ¾Ğ±Ñ‹ Ğ½Ğµ Ğ²Ğ·ÑÑ‚ÑŒ
-     * Ğ·Ğ°Ğ³Ğ¾Ğ»Ğ¾Ğ²Ğ¾Ğº/Ğ¼Ğ¸Ğ½Ğ¸-Ğ¿Ğ»ĞµĞµÑ€ Ğ²Ñ‹ÑˆĞµ ÑĞ¿Ğ¸ÑĞºĞ°.
-     */
-    private fun findAlbumTargetTextByApiMetadata(
-        root: AccessibilityNodeInfo,
-        expectedTrackTitle: String?,
-        expectedArtists: List<String>
-    ): Candidate? {
-        val title = expectedTrackTitle?.trim().orEmpty()
-        val normalizedTitle = title.normalizeYm().stripExplicitTrackMarkers()
-        if (normalizedTitle.isBlank()) return null
-
-        val normalizedArtists = expectedArtists
-            .map { it.normalizeYm() }
-            .filter { it.isNotBlank() }
-
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val anchorIndex = all.indexOfFirst { node ->
-            val ownId = node.viewIdResourceName.orEmpty().normalizeYm()
-            val ownLabel = labelOf(node).normalizeYm()
-            ownId.contains("fragmentcontainerview") || ownLabel.contains("fragmentcontainerview")
-        }
-
-        fun buildCandidates(requireAfterAnchor: Boolean): List<Candidate> = all.mapIndexedNotNull { index, node ->
-            if (!node.isVisibleToUser) return@mapIndexedNotNull null
-            if (requireAfterAnchor && anchorIndex >= 0 && index <= anchorIndex) return@mapIndexedNotNull null
-
-            val raw = listOf(
-                node.text?.toString().orEmpty(),
-                node.contentDescription?.toString().orEmpty()
-            ).filter { it.isNotBlank() }.joinToString(" ").trim()
-            if (raw.isBlank()) return@mapIndexedNotNull null
-
-            val normalized = raw.normalizeYm()
-            if (isDefinitelyNotAlbumTargetTrack(normalized)) return@mapIndexedNotNull null
-
-            // Ğ£ Ñ‚Ñ€ĞµĞºĞ¾Ğ² Ñ explicit-Ğ¼ĞµÑ‚ĞºĞ¾Ğ¹ Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞ° Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ÑĞµÑ‚ Ğ² Accessibility Ñ€ÑĞ´Ğ¾Ğ¼ Ñ title
-            // Ğ¾Ğ¿Ğ¸ÑĞ°Ğ½Ğ¸Ğµ Ğ·Ğ½Ğ°Ñ‡ĞºĞ°: "Ğ½ĞµĞ½Ğ¾Ñ€Ğ¼Ğ°Ñ‚Ğ¸Ğ²Ğ½Ğ°Ñ Ğ»ĞµĞºÑĞ¸ĞºĞ°", "Ğ²Ğ¾ÑĞºĞ»Ğ¸Ñ†Ğ°Ñ‚ĞµĞ»ÑŒĞ½Ñ‹Ğ¹ Ğ·Ğ½Ğ°Ğº" Ğ¸ Ñ‚.Ğ¿.
-            // Ğ˜Ğ·-Ğ·Ğ° ÑÑ‚Ğ¾Ğ³Ğ¾ raw label ÑƒĞ¶Ğµ Ğ½Ğµ Ñ€Ğ°Ğ²ĞµĞ½ title, Ñ…Ğ¾Ñ‚Ñ Ğ²Ğ¸Ğ·ÑƒĞ°Ğ»ÑŒĞ½Ğ¾ ÑÑ‚Ğ¾ Ñ‚Ğ¾Ñ‚ Ğ¶Ğµ Ñ‚Ñ€ĞµĞº.
-            // Ğ”Ğ»Ñ ÑÑ€Ğ°Ğ²Ğ½ĞµĞ½Ğ¸Ñ Ñ API-title ÑƒĞ±Ğ¸Ñ€Ğ°ĞµĞ¼ Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ Ñ‚Ğ°ĞºĞ¸Ğµ ÑĞ»ÑƒĞ¶ĞµĞ±Ğ½Ñ‹Ğµ explicit-Ğ¼Ğ°Ñ€ĞºĞµÑ€Ñ‹.
-            val normalizedForMatch = normalized.stripExplicitTrackMarkers()
-            val exactTitle = normalizedForMatch == normalizedTitle
-            val containsTitle = !exactTitle &&
-                normalizedForMatch.contains(normalizedTitle) &&
-                normalizedForMatch.length <= normalizedTitle.length + 72
-            val titleContainsNode = !exactTitle &&
-                normalizedTitle.contains(normalizedForMatch) &&
-                normalizedForMatch.length >= 4
-            if (!exactTitle && !containsTitle && !titleContainsNode) return@mapIndexedNotNull null
-
-            val r = boundsOf(node)
-            if (!isPotentialAlbumTrackTextBounds(r)) return@mapIndexedNotNull null
-            if (node.childCount > 0 && r.height() > dp(64)) return@mapIndexedNotNull null
-
-            val row = findLikelyRowContainer(node) ?: node
-            val rowLabelRaw = labelWithChildren(row)
-            val rowContext = (rowLabelRaw + " " + ancestorLabels(node, 5)).normalizeYm()
-
-            // Ğ’ Ğ¾Ğ´Ğ¸Ğ½Ğ¾Ñ‡Ğ½Ñ‹Ñ… Ñ€ĞµĞ»Ğ¸Ğ·Ğ°Ñ… Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞ° Ñ‡Ğ°ÑÑ‚Ğ¾ Ğ¿Ğ¾ĞºĞ°Ğ·Ñ‹Ğ²Ğ°ĞµÑ‚ ÑÑ‚Ñ€Ğ¾ĞºÑƒ "ĞœĞ¾Ñ Ğ²Ğ¾Ğ»Ğ½Ğ° Ğ¿Ğ¾ <title>".
-            // Ğ’Ğ½ÑƒÑ‚Ñ€Ğ¸ Ğ½ĞµÑ‘ Ğ¼Ğ¾Ğ¶ĞµÑ‚ Ğ±Ñ‹Ñ‚ÑŒ Ğ¾Ñ‚Ğ´ĞµĞ»ÑŒĞ½Ñ‹Ğ¹ Ğ´Ğ¾Ñ‡ĞµÑ€Ğ½Ğ¸Ğ¹ TextView Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ Ñ Ğ½Ğ°Ğ·Ğ²Ğ°Ğ½Ğ¸ĞµĞ¼ Ñ‚Ñ€ĞµĞºĞ°,
-            // Ğ¿Ğ¾ÑÑ‚Ğ¾Ğ¼Ñƒ Ğ¿Ñ€Ğ¾ÑÑ‚Ğ¾Ğµ ÑĞ¾Ğ²Ğ¿Ğ°Ğ´ĞµĞ½Ğ¸Ğµ raw == title Ğ¾ÑˆĞ¸Ğ±Ğ¾Ñ‡Ğ½Ğ¾ Ğ²Ñ‹Ğ±Ğ¸Ñ€Ğ°Ğ»Ğ¾ Ğ¸Ğ¼ĞµĞ½Ğ½Ğ¾ ÑÑ‚Ñƒ Ğ¿Ğ¾Ğ»Ğ¾ÑĞºÑƒ.
-            if (isUnsafeAlbumTitleContext(rowContext)) return@mapIndexedNotNull null
-
-            val artistScore = nearbyArtistScore(all, r, normalizedArtists)
-            val rowHasDuration = rowLabelRaw.contains(Regex("""\b\d{1,2}:\d{2}\b"""))
-            var score = 0
-            if (exactTitle) score += 280 else score += 165
-            if (requireAfterAnchor && anchorIndex >= 0) score += 70
-            score += artistScore
-            if (rowHasDuration) score += 45
-            if (node.childCount == 0) score += 20
-
-            // ĞŸÑ€ĞµĞ´Ğ¿Ğ¾Ñ‡Ğ¸Ñ‚Ğ°ĞµĞ¼ Ñ€ĞµĞ°Ğ»ÑŒĞ½Ñ‹Ğµ title TextView ÑĞ»ĞµĞ²Ğ°/Ğ¿Ğ¾ Ñ†ĞµĞ½Ñ‚Ñ€Ñƒ, Ğ° Ğ½Ğµ Ğ¼ĞµĞ½Ñ/ÑĞ»ÑƒĞ¶ĞµĞ±Ğ½Ñ‹Ğ¹ ÑĞ»ĞµĞ¼ĞµĞ½Ñ‚ ÑĞ¿Ñ€Ğ°Ğ²Ğ°.
-            if (r.left < resources.displayMetrics.widthPixels * 0.68f) score += 35
-
-            val h = resources.displayMetrics.heightPixels
-            // ĞŸĞ¾ Ñ‚Ğ²Ğ¾Ğ¸Ğ¼ Ğ½Ğ°Ğ±Ğ»ÑĞ´ĞµĞ½Ğ¸ÑĞ¼ Ğ½ÑƒĞ¶Ğ½Ñ‹Ğ¹ Ñ‚Ñ€ĞµĞº Ğ² Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼Ğ°Ñ… Ğ¾Ğ±Ñ‹Ñ‡Ğ½Ğ¾ Ğ¾ĞºĞ°Ğ·Ñ‹Ğ²Ğ°ĞµÑ‚ÑÑ Ğ² Ğ²ĞµÑ€Ñ…Ğ½ĞµĞ¹ Ñ‡Ğ°ÑÑ‚Ğ¸ ÑĞºÑ€Ğ°Ğ½Ğ°.
-            // Ğ­Ñ‚Ğ¾ Ğ½Ğµ Ğ¶Ñ‘ÑÑ‚ĞºĞ¾Ğµ Ğ¿Ñ€Ğ°Ğ²Ğ¸Ğ»Ğ¾, Ğ½Ğ¾ Ñ…Ğ¾Ñ€Ğ¾ÑˆĞ¸Ğ¹ ÑĞºĞ¾Ñ€Ğ¸Ğ½Ğ³, Ñ‡Ñ‚Ğ¾Ğ±Ñ‹ Ğ½Ğµ ÑƒĞ¹Ñ‚Ğ¸ Ğ² Ñ€ĞµĞºĞ¾Ğ¼ĞµĞ½Ğ´Ğ°Ñ†Ğ¸Ğ¸/Ğ¼Ğ¸Ğ½Ğ¸-Ğ¿Ğ»ĞµĞµÑ€ Ğ½Ğ¸Ğ¶Ğµ.
-            when (r.centerY()) {
-                in (h * 0.16f).toInt()..(h * 0.58f).toInt() -> score += 35
-                in (h * 0.58f).toInt()..(h * 0.72f).toInt() -> score += 5
-                else -> score -= 30
-            }
-
-            Candidate(
-                node,
-                r,
-                score,
-                "API title='$title', artistFilter=${normalizedArtists.isNotEmpty()}, artists='${expectedArtists.joinToString(", ")}', node#$index '$raw' [$r], row='${rowLabelRaw.take(120)}'"
-            )
-        }.sortedByDescending { it.score }
-
-        val anchored = buildCandidates(requireAfterAnchor = true)
-        val bestAnchored = anchored.firstOrNull { it.score >= 210 }
-        if (bestAnchored != null) return bestAnchored
-
-        // Fallback Ğ½ÑƒĞ¶ĞµĞ½ Ğ´Ğ»Ñ ÑĞºÑ€Ğ°Ğ½Ğ¾Ğ², Ğ³Ğ´Ğµ fragment_container_view Ğ½Ğµ Ğ¿Ğ¾Ğ¿Ğ°Ğ´Ğ°ĞµÑ‚ Ğ² Ğ°ĞºÑ‚ÑƒĞ°Ğ»ÑŒĞ½Ğ¾Ğµ
-        // Accessibility-Ğ´ĞµÑ€ĞµĞ²Ğ¾ Ğ¸Ğ»Ğ¸ Ğ¿Ñ€Ğ¸Ñ…Ğ¾Ğ´Ğ¸Ñ‚ Ğ½Ğµ Ğ¿ĞµÑ€ĞµĞ´ ÑĞ¿Ğ¸ÑĞºĞ¾Ğ¼. Ğ’ÑÑ‘ Ñ€Ğ°Ğ²Ğ½Ğ¾ Ğ¸Ñ‰ĞµĞ¼ ĞºĞ¾Ğ½ĞºÑ€ĞµÑ‚Ğ½Ñ‹Ğ¹ title
-        // Ğ¸ Ğ¾Ñ‚ÑĞµĞºĞ°ĞµĞ¼ "ĞœĞ¾Ñ Ğ²Ğ¾Ğ»Ğ½Ğ°"/Ñ€ĞµĞºĞ¾Ğ¼ĞµĞ½Ğ´Ğ°Ñ†Ğ¸Ğ¸ Ğ¿Ğ¾ ĞºĞ¾Ğ½Ñ‚ĞµĞºÑÑ‚Ñƒ ÑÑ‚Ñ€Ğ¾ĞºĞ¸.
-        return buildCandidates(requireAfterAnchor = false).firstOrNull { it.score >= 230 }
-    }
-
-    private fun nearbyArtistScore(
-        all: List<AccessibilityNodeInfo>,
-        titleBounds: Rect,
-        normalizedArtists: List<String>
-    ): Int {
-        if (normalizedArtists.isEmpty()) return 0
-        val titleCenterY = titleBounds.centerY()
-        var best = 0
-        all.forEach { node ->
-            if (!node.isVisibleToUser) return@forEach
-            val raw = listOf(
-                node.text?.toString().orEmpty(),
-                node.contentDescription?.toString().orEmpty()
-            ).filter { it.isNotBlank() }.joinToString(" ")
-            val normalized = raw.normalizeYm()
-            if (normalized.isBlank()) return@forEach
-            val matched = normalizedArtists.any { artist -> normalized.contains(artist) || artist.contains(normalized) }
-            if (!matched) return@forEach
-            val r = boundsOf(node)
-            val dy = abs(r.centerY() - titleCenterY)
-            if (dy <= dp(54)) best = maxOf(best, 90)
-            else if (dy <= dp(96)) best = maxOf(best, 45)
-        }
-        return best
-    }
-
-
-    private fun isPotentialAlbumTrackTextBounds(r: Rect): Boolean {
-        val dm = resources.displayMetrics
-        if (r.isEmpty) return false
-        if (r.centerY() < dm.heightPixels * 0.12f) return false
-        if (r.centerY() > dm.heightPixels * 0.74f) return false
-        if (r.height() !in dp(8)..dp(72)) return false
-        if (r.width() < dm.widthPixels * 0.05f) return false
-        // ĞĞ°Ğ·Ğ²Ğ°Ğ½Ğ¸Ñ Ñ‚Ñ€ĞµĞºĞ¾Ğ² Ğ² ÑĞ¿Ğ¸ÑĞºĞµ Ğ¾Ğ±Ñ‹Ñ‡Ğ½Ğ¾ ÑĞ»ĞµĞ²Ğ°/Ğ¿Ğ¾ Ñ†ĞµĞ½Ñ‚Ñ€Ñƒ. ĞŸÑ€Ğ°Ğ²Ğ°Ñ Ğ·Ğ¾Ğ½Ğ° Ğ·Ğ°Ğ½ÑÑ‚Ğ° ĞºĞ½Ğ¾Ğ¿ĞºĞ°Ğ¼Ğ¸.
-        if (r.left > dm.widthPixels * 0.72f) return false
-        return true
-    }
-
-    private fun isUnsafeAlbumTitleContext(context: String): Boolean {
-        if (context.isBlank()) return true
-        val bad = listOf(
-            "Ğ¼Ğ¾ÑĞ²Ğ¾Ğ»Ğ½Ğ°", "Ğ²Ğ¾Ğ»Ğ½Ğ°Ğ¿Ğ¾Ñ‚Ñ€ĞµĞºÑƒ", "Ñ€Ğ°Ğ´Ğ¸Ğ¾Ğ¿Ğ¾Ñ‚Ñ€ĞµĞºÑƒ", "Ğ·Ğ°Ğ¿ÑƒÑÑ‚Ğ¸Ñ‚ÑŒĞ²Ğ¾Ğ»Ğ½Ñƒ", "ÑĞ»ÑƒÑˆĞ°Ñ‚ÑŒĞ²Ğ¾Ğ»Ğ½Ñƒ",
-            "Ñ€ĞµĞºĞ¾Ğ¼ĞµĞ½Ğ´Ğ°", "recommend", "Ğ¿Ğ¾Ñ…Ğ¾Ğ¶", "Ğ²Ğ°Ğ¼Ğ¼Ğ¾Ğ¶ĞµÑ‚Ğ¿Ğ¾Ğ½Ñ€Ğ°Ğ²",
-            "Ğ¿Ğ¾Ğ´ĞµĞ»Ğ¸Ñ‚ÑŒÑÑ", "share", "Ğ¿Ğ¾Ğ¸ÑĞº", "search", "Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ", "queue",
-            "Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ĞµĞ½", "Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ĞµĞ½Ğ¾", "added", "Ğ¿ĞµÑ€ĞµĞ¼ĞµÑˆĞ°Ñ‚ÑŒ", "shuffle", "Ğ¿Ğ¾Ğ²Ñ‚Ğ¾Ñ€", "repeat"
-        )
-        return bad.any { context.contains(it) }
-    }
-
-    private fun ancestorLabels(node: AccessibilityNodeInfo, maxDepth: Int): String {
-        val out = StringBuilder()
-        var cur = node.parent
-        var depth = 0
-        while (cur != null && depth < maxDepth) {
-            // Ğ¢Ğ¾Ğ»ÑŒĞºĞ¾ ÑĞ¾Ğ±ÑÑ‚Ğ²ĞµĞ½Ğ½Ñ‹Ğµ label/id ancestor-ÑƒĞ·Ğ»Ğ¾Ğ². ĞĞµ Ğ±ĞµÑ€Ñ‘Ğ¼ labelWithChildren(),
-            // Ğ¸Ğ½Ğ°Ñ‡Ğµ Ğ² ĞºĞ¾Ğ½Ñ‚ĞµĞºÑÑ‚ Ğ¾Ğ´Ğ½Ğ¾Ğ³Ğ¾ Ñ‚Ñ€ĞµĞºĞ° Ğ¼Ğ¾Ğ³ÑƒÑ‚ Ğ¿Ğ¾Ğ¿Ğ°ÑÑ‚ÑŒ ÑĞ¾ÑĞµĞ´Ğ½Ğ¸Ğµ ÑÑ‚Ñ€Ğ¾ĞºĞ¸, Ğ½Ğ°Ğ¿Ñ€Ğ¸Ğ¼ĞµÑ€
-            // "ĞœĞ¾Ñ Ğ²Ğ¾Ğ»Ğ½Ğ° Ğ¿Ğ¾ ..." Ğ¸Ğ»Ğ¸ Ñ€ĞµĞºĞ¾Ğ¼ĞµĞ½Ğ´Ğ°Ñ†Ğ¸Ğ¸ Ğ¸Ğ· Ñ‚Ğ¾Ğ³Ğ¾ Ğ¶Ğµ ÑĞ¿Ğ¸ÑĞºĞ°.
-            val label = labelOf(cur!!)
-            if (label.isNotBlank()) out.append(' ').append(label)
-            cur = cur!!.parent
-            depth++
-        }
-        return out.toString()
-    }
-
-    /**
-     * ĞĞ°Ñ…Ğ¾Ğ´Ğ¸Ñ‚ Ğ¸Ğ¼ĞµĞ½Ğ½Ğ¾ Ñ‚ĞµĞºÑÑ‚Ğ¾Ğ²ÑƒÑ ÑÑ‚Ñ€Ğ¾ĞºÑƒ Ğ½ÑƒĞ¶Ğ½Ğ¾Ğ³Ğ¾ Ñ‚Ñ€ĞµĞºĞ° Ğ¿Ğ¾ÑĞ»Ğµ fragment_container_view.
-     * Ğ’Ğ°Ğ¶Ğ½Ğ¾: Ğ²Ğ¾Ğ·Ğ²Ñ€Ğ°Ñ‰Ğ°ĞµĞ¼ ĞĞ• ÑˆĞ¸Ñ€Ğ¾ĞºĞ¸Ğ¹ row-container, Ğ° tight bounds ÑĞ°Ğ¼Ğ¾Ğ³Ğ¾ Ñ‚ĞµĞºÑÑ‚Ğ°.
-     * Ğ’ fixed11 Ğ¸ÑĞ¿Ğ¾Ğ»ÑŒĞ·Ğ¾Ğ²Ğ°Ğ»ÑÑ parent row/container, Ğ¸Ğ·-Ğ·Ğ° ÑÑ‚Ğ¾Ğ³Ğ¾ Y-ĞºĞ¾Ğ¾Ñ€Ğ´Ğ¸Ğ½Ğ°Ñ‚Ğ° Ñ‡Ğ°ÑÑ‚Ğ¾
-     * Ğ¿Ğ¾Ğ¿Ğ°Ğ´Ğ°Ğ»Ğ° Ğ½Ğ° ÑĞ»ĞµĞ´ÑƒÑÑ‰ÑƒÑ ÑÑ‚Ñ€Ğ¾ĞºÑƒ.
-     */
-    private fun findAlbumTargetTextAfterFragment(root: AccessibilityNodeInfo): Candidate? {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val anchorIndex = all.indexOfFirst { node ->
-            val ownId = node.viewIdResourceName.orEmpty().normalizeYm()
-            val ownLabel = labelOf(node).normalizeYm()
-            ownId.contains("fragmentcontainerview") || ownLabel.contains("fragmentcontainerview")
-        }
-        if (anchorIndex < 0) return null
-
-        val dm = resources.displayMetrics
-        for (i in (anchorIndex + 1) until all.size) {
-            val node = all[i]
-            if (!node.isVisibleToUser) continue
-
-            // Ğ”Ğ»Ñ Ğ²Ñ‹Ğ±Ğ¾Ñ€Ğ° Ñ†ĞµĞ»ĞµĞ²Ğ¾Ğ¹ ÑÑ‚Ñ€Ğ¾ĞºĞ¸ Ğ¸ÑĞ¿Ğ¾Ğ»ÑŒĞ·ÑƒĞµĞ¼ Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ text/contentDescription.
-            // viewId Ñ‚ÑƒÑ‚ Ğ¾Ğ¿Ğ°ÑĞµĞ½: Ğ¾Ğ½ Ğ¼Ğ¾Ğ¶ĞµÑ‚ Ğ¸Ğ´Ñ‚Ğ¸ Ñ€Ğ°Ğ½ÑŒÑˆĞµ Ğ½Ğ°ÑÑ‚Ğ¾ÑÑ‰ĞµĞ³Ğ¾ Ñ‚ĞµĞºÑÑ‚Ğ° Ñ‚Ñ€ĞµĞºĞ°.
-            val raw = listOf(
-                node.text?.toString().orEmpty(),
-                node.contentDescription?.toString().orEmpty()
-            ).filter { it.isNotBlank() }.joinToString(" ").trim()
-            if (raw.isBlank()) continue
-
-            val normalized = raw.normalizeYm()
-            if (isDefinitelyNotAlbumTargetTrack(normalized)) continue
-            if (normalized.matches(Regex("^[0-9]{1,2}[0-9]{2}$"))) continue
-
-            val r = boundsOf(node)
-            if (!isPotentialTrackTextBounds(r)) continue
-
-            // Ğ•ÑĞ»Ğ¸ ÑÑ‚Ğ¾ parent Ñ ĞºÑƒÑ‡ĞµĞ¹ Ğ´ĞµÑ‚ĞµĞ¹ Ğ¸ Ğ¾Ğ³Ñ€Ğ¾Ğ¼Ğ½Ğ¾Ğ¹ Ğ²Ñ‹ÑĞ¾Ñ‚Ğ¾Ğ¹, Ğ¿Ñ€Ğ¾Ğ¿ÑƒÑĞºĞ°ĞµĞ¼: Ğ½Ğ°Ğ¼ Ğ½ÑƒĞ¶ĞµĞ½
-            // Ñ‚ĞµĞºÑÑ‚Ğ¾Ğ²Ñ‹Ğ¹ ÑĞ»ĞµĞ¼ĞµĞ½Ñ‚, Ğ° Ğ½Ğµ ĞºĞ¾Ğ½Ñ‚ĞµĞ¹Ğ½ĞµÑ€ ÑĞ¿Ğ¸ÑĞºĞ°/ĞºĞ°Ñ€Ñ‚Ğ¾Ñ‡ĞºĞ¸.
-            if (node.childCount > 0 && r.height() > dp(64)) continue
-
-            return Candidate(node, r, 100000 - (i - anchorIndex), "#$i ${raw.take(120)} [$r]")
-        }
-        return null
-    }
-
-    /**
-     * Ğ‘ĞµĞ·Ğ¾Ğ¿Ğ°ÑĞ½Ñ‹Ğ¹ Ğ¿ĞµÑ€Ğ²Ñ‹Ğ¹ ÑˆĞ°Ğ³: ĞµÑĞ»Ğ¸ Ñƒ Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞ¸ Ğ² Ğ´ĞµÑ€ĞµĞ²Ğµ ĞµÑÑ‚ÑŒ ÑĞ²Ğ½Ğ°Ñ ĞºĞ½Ğ¾Ğ¿ĞºĞ° overflow/menu
-     * Ğ½Ğ° Ñ‚Ğ¾Ğ¹ Ğ¶Ğµ Ğ²Ñ‹ÑĞ¾Ñ‚Ğµ, Ñ‡Ñ‚Ğ¾ Ğ¸ Ñ‚ĞµĞºÑÑ‚ Ğ½ÑƒĞ¶Ğ½Ğ¾Ğ³Ğ¾ Ñ‚Ñ€ĞµĞºĞ°, Ğ¶Ğ¼Ñ‘Ğ¼ ĞµÑ‘ Ñ‡ĞµÑ€ĞµĞ· ACTION_CLICK.
-     */
-    private fun clickAlbumTargetOverflowByExplicitButton(
-        root: AccessibilityNodeInfo,
-        expectedTrackTitle: String?,
-        expectedArtists: List<String>
-    ): Boolean {
-        if (albumTargetRowTapSent) return false
-        val target = if (!expectedTrackTitle.isNullOrBlank()) {
-            findAlbumTargetTextByApiMetadata(root, expectedTrackTitle, expectedArtists) ?: return false
-        } else {
-            findAlbumTargetTextAfterFragment(root) ?: return false
-        }
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-        val targetY = target.bounds.centerY()
-
-        val candidates = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            val clickable = if (node.isClickable) node else clickableParent(node)
-            if (clickable == null) return@mapNotNull null
-            val r = boundsOf(clickable)
-            if (!isRightSideButtonNearTargetText(r, targetY)) return@mapNotNull null
-
-            val combined = (
-                labelOf(node) + " " + labelOf(clickable) + " " +
-                    node.viewIdResourceName.orEmpty() + " " + clickable.viewIdResourceName.orEmpty() + " " +
-                    node.className?.toString().orEmpty() + " " + clickable.className?.toString().orEmpty()
-                ).normalizeYm()
-
-            val className = (node.className?.toString().orEmpty() + " " + clickable.className?.toString().orEmpty()).lowercase()
-            val hasExplicitMenu = hasOverflowSignal(combined)
-            val imageLike = className.contains("imagebutton") || className.contains("imageview")
-            val yDistance = abs(r.centerY() - targetY)
-            if (!hasExplicitMenu && !imageLike) return@mapNotNull null
-            // Ğ‘ĞµĞ· ÑĞ²Ğ½Ğ¾Ğ³Ğ¾ contentDescription/id Ğ¼ĞµĞ½Ñ Ñ€Ğ°Ğ·Ñ€ĞµÑˆĞ°ĞµĞ¼ Ñ‚Ğ¾Ğ»ÑŒĞºĞ¾ Ğ¿Ğ¾Ñ‡Ñ‚Ğ¸ Ğ¸Ğ´ĞµĞ°Ğ»ÑŒĞ½Ğ¾
-            // ÑĞ¾Ğ²Ğ¿Ğ°Ğ´Ğ°ÑÑ‰ÑƒÑ Ğ¿Ğ¾ Ğ²Ñ‹ÑĞ¾Ñ‚Ğµ Ğ¿Ñ€Ğ°Ğ²ÑƒÑ ĞºĞ½Ğ¾Ğ¿ĞºÑƒ. Ğ­Ñ‚Ğ¾ Ğ·Ğ°Ñ‰Ğ¸Ñ‰Ğ°ĞµÑ‚ Ğ¾Ñ‚ Ğ²Ñ‹Ğ±Ğ¾Ñ€Ğ° overflow
-            // ÑĞ»ĞµĞ´ÑƒÑÑ‰ĞµĞ³Ğ¾ Ñ‚Ñ€ĞµĞºĞ°, Ñ‡Ñ‚Ğ¾ Ğ¿Ñ€Ğ¾ÑĞ²Ğ»ÑĞ»Ğ¾ÑÑŒ ÑĞ¾ Ğ²Ñ‚Ğ¾Ñ€Ğ¾Ğ¹ Ğ¿Ğ¾Ğ¿Ñ‹Ñ‚ĞºĞ¸.
-            if (!hasExplicitMenu && yDistance > dp(16)) return@mapNotNull null
-
-            var score = 200
-            if (hasExplicitMenu) score += 120
-            if (imageLike) score += 35
-            score += (80 - yDistance / dp(1)).coerceAtLeast(0)
-            score += if (r.centerX() > resources.displayMetrics.widthPixels * 0.82f) 40 else 0
-            Candidate(clickable, r, score, "target=${target.label} | button=$combined [$r]")
-        }
-            .distinctBy { "${it.bounds.left}:${it.bounds.top}:${it.bounds.right}:${it.bounds.bottom}" }
-            .sortedByDescending { it.score }
-
-        val best = candidates.firstOrNull() ?: return false
-        albumTargetRowTapSent = true
-        albumTargetRowDescription = best.label
-        return best.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-    }
-
-    /**
-     * Fallback Ğ±ĞµĞ· Ğ¿ĞµÑ€ĞµĞ±Ğ¾Ñ€Ğ° ÑĞ¾ÑĞµĞ´Ğ½Ğ¸Ñ… ÑÑ‚Ñ€Ğ¾Ğº: Ğ¾Ğ´Ğ¸Ğ½ tap ÑÑ‚Ñ€Ğ¾Ğ³Ğ¾ Ğ½Ğ° Y Ñ‚ĞµĞºÑÑ‚Ğ° Ğ½ÑƒĞ¶Ğ½Ğ¾Ğ³Ğ¾ Ñ‚Ñ€ĞµĞºĞ°.
-     * ĞĞµ Ğ¸ÑĞ¿Ğ¾Ğ»ÑŒĞ·ÑƒĞµĞ¼ centerY Ñ€Ğ¾Ğ´Ğ¸Ñ‚ĞµĞ»ÑŒÑĞºĞ¾Ğ³Ğ¾ row-container, Ğ¿Ğ¾Ñ‚Ğ¾Ğ¼Ñƒ Ñ‡Ñ‚Ğ¾ Ğ¾Ğ½ Ğ² fixed11 Ğ¿Ğ¾Ğ¿Ğ°Ğ´Ğ°Ğ»
-     * Ğ½Ğ° ÑĞ»ĞµĞ´ÑƒÑÑ‰ÑƒÑ ĞºĞ¾Ğ¼Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ñ.
-     */
-    private fun tapAlbumTargetOverflowByExactTextLine(
-        root: AccessibilityNodeInfo,
-        expectedTrackTitle: String?,
-        expectedArtists: List<String>
-    ): Boolean {
-        if (albumTargetRowTapSent) return false
-        val target = if (!expectedTrackTitle.isNullOrBlank()) {
-            findAlbumTargetTextByApiMetadata(root, expectedTrackTitle, expectedArtists) ?: return false
-        } else {
-            findAlbumTargetTextAfterFragment(root) ?: return false
-        }
-        val dm = resources.displayMetrics
-        val x = (dm.widthPixels - dp(34)).coerceIn((dm.widthPixels * 0.72f).toInt(), dm.widthPixels - dp(14))
-        // Ğ‘ĞµÑ€Ñ‘Ğ¼ Ğ½Ğµ Ğ½Ğ¸Ğ¶Ğ½ÑÑ Ñ‡Ğ°ÑÑ‚ÑŒ ÑÑ‚Ñ€Ğ¾ĞºĞ¸ Ğ¸ Ğ½Ğµ parent-row, Ğ° Ğ²ĞµÑ€Ñ…Ğ½ÑÑ Ğ¿Ğ¾Ğ»Ğ¾Ğ²Ğ¸Ğ½Ñƒ ÑĞ°Ğ¼Ğ¾Ğ³Ğ¾
-        // Ñ‚ĞµĞºÑÑ‚Ğ¾Ğ²Ğ¾Ğ³Ğ¾ node. Ğ­Ñ‚Ğ¾ ÑĞ½Ğ¸Ğ¶Ğ°ĞµÑ‚ Ñ€Ğ¸ÑĞº Ğ¿Ğ¾Ğ¿Ğ°ÑÑ‚ÑŒ Ğ² touch-Ğ·Ğ¾Ğ½Ñƒ ÑĞ»ĞµĞ´ÑƒÑÑ‰ĞµĞ¹ ÑÑ‚Ñ€Ğ¾ĞºĞ¸
-        // Ğ¿Ğ¾ÑĞ»Ğµ Ñ‚Ğ¾Ğ³Ğ¾, ĞºĞ°Ğº layout Ğ¯.ĞœÑƒĞ·Ñ‹ĞºĞ¸ Ğ¿ĞµÑ€ĞµÑĞ¾Ğ±Ñ€Ğ°Ğ»ÑÑ Ğ½Ğ° Ğ¿Ğ¾Ğ²Ñ‚Ğ¾Ñ€Ğ½Ğ¾Ğ¹ Ğ¿Ğ¾Ğ¿Ñ‹Ñ‚ĞºĞµ.
-        val rawY = target.bounds.top + (target.bounds.height() * 0.42f).toInt()
-        val y = rawY.coerceIn(dp(88), (dm.heightPixels * 0.76f).toInt())
-        albumTargetRowTapSent = true
-        albumTargetRowDescription = "${target.label} | exactY=$y rawY=$rawY"
-        return tap(x, y)
-    }
-
-    private fun isPotentialTrackTextBounds(r: Rect): Boolean {
-        val dm = resources.displayMetrics
-        if (r.isEmpty) return false
-        if (r.centerY() < dm.heightPixels * 0.18f) return false
-        if (r.centerY() > dm.heightPixels * 0.80f) return false
-        if (r.height() !in dp(8)..dp(72)) return false
-        if (r.width() < dm.widthPixels * 0.06f) return false
-        return true
-    }
-
-    private fun isRightSideButtonNearTargetText(r: Rect, targetY: Int): Boolean {
-        val dm = resources.displayMetrics
-        if (r.isEmpty) return false
-        val width = r.width()
-        val height = r.height()
-        if (width !in dp(14)..dp(120)) return false
-        if (height !in dp(14)..dp(120)) return false
-        if (r.centerX() < dm.widthPixels * 0.62f) return false
-        // Ğ£Ğ·ĞºĞ¾Ğµ Ğ¾ĞºĞ½Ğ¾ Ğ¿Ğ¾ Y ĞºÑ€Ğ¸Ñ‚Ğ¸Ñ‡Ğ½Ğ¾: Ğ¿Ñ€Ğ¸ Ğ¿Ğ¾Ğ²Ñ‚Ğ¾Ñ€Ğ½Ğ¾Ğ¼ Ğ¾Ñ‚ĞºÑ€Ñ‹Ñ‚Ğ¸Ğ¸ Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼Ğ° ÑĞ¾ÑĞµĞ´Ğ½Ğ¸Ğµ ÑÑ‚Ñ€Ğ¾ĞºĞ¸
-        // Ñ‚Ğ¾Ğ¶Ğµ Ğ¼Ğ¾Ğ³ÑƒÑ‚ Ğ¿Ğ¾Ğ¿Ğ°Ğ´Ğ°Ñ‚ÑŒ Ğ² Ğ´ĞµÑ€ĞµĞ²Ğ¾ ĞºĞ°Ğº ImageButton Ğ±ĞµĞ· Ñ‚ĞµĞºÑÑ‚Ğ°. Ğ¨Ğ¸Ñ€Ğ¾ĞºĞ¸Ğ¹ Ğ´Ğ¾Ğ¿ÑƒÑĞº
-        // Ğ²Ñ‹Ğ±Ğ¸Ñ€Ğ°Ğ» ĞºĞ½Ğ¾Ğ¿ĞºÑƒ ÑĞ»ĞµĞ´ÑƒÑÑ‰ĞµĞ¹ ÑÑ‚Ñ€Ğ¾ĞºĞ¸.
-        if (abs(r.centerY() - targetY) > dp(24)) return false
-        return true
-    }
-
-    private fun isDefinitelyNotAlbumTargetTrack(label: String): Boolean {
-        if (label.isBlank()) return true
-        val badParts = listOf(
-            "fragmentcontainerview",
-            "Ğ½Ñ€Ğ°Ğ²Ğ¸Ñ‚ÑÑ", "Ğ½ĞµĞ½Ñ€Ğ°Ğ²Ğ¸Ñ‚ÑÑ", "Ğ¿Ğ°ÑƒĞ·Ğ°", "pause", "Ğ²Ğ¾ÑĞ¿Ñ€Ğ¾Ğ¸Ğ·Ğ²ĞµÑÑ‚Ğ¸", "Ğ²Ğ¾ÑĞ¿Ñ€Ğ¾Ğ¸Ğ·Ğ²ĞµĞ´ĞµĞ½Ğ¸Ğµ",
-            "Ğ½Ğ°Ğ·Ğ°Ğ´", "back", "Ğ·Ğ°ĞºÑ€Ñ‹Ñ‚ÑŒ", "close", "Ğ¿Ğ¾Ğ¸ÑĞº", "search", "Ğ¿Ğ¾Ğ´ĞµĞ»Ğ¸Ñ‚ÑŒÑÑ", "share",
-            "Ñ€ĞµĞºĞ¾Ğ¼ĞµĞ½Ğ´Ğ°", "recommend", "Ğ¿Ğ¾Ñ…Ğ¾Ğ¶", "Ğ²Ğ°Ğ¼Ğ¼Ğ¾Ğ¶ĞµÑ‚Ğ¿Ğ¾Ğ½Ñ€Ğ°Ğ²", "Ğ´Ñ€ÑƒĞ³Ğ¸ĞµÑ€ĞµĞ»Ğ¸Ğ·Ñ‹", "ÑĞ¼Ğ¾Ñ‚Ñ€Ğ¸Ñ‚Ğµ",
-            "Ñ€Ğ°Ğ´Ğ¸Ğ¾Ğ¿Ğ¾Ñ‚Ñ€ĞµĞºÑƒ", "Ñ€Ğ°Ğ´Ğ¸Ğ¾", "Ğ²Ğ¾Ğ»Ğ½Ğ°", "wave",
-            "Ğ¾Ñ‡ĞµÑ€ĞµĞ´ÑŒ", "queue", "Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ĞµĞ½", "Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ»ĞµĞ½Ğ¾", "added", "Ğ¿ĞµÑ€ĞµĞ¼ĞµÑˆĞ°Ñ‚ÑŒ", "shuffle", "Ğ¿Ğ¾Ğ²Ñ‚Ğ¾Ñ€", "repeat",
-            "ÑĞºĞ°Ñ‡Ğ°Ñ‚ÑŒĞ°Ğ»ÑŒĞ±Ğ¾Ğ¼", "downloadalbum", "Ğ´Ğ¾Ğ±Ğ°Ğ²Ğ¸Ñ‚ÑŒĞ°Ğ»ÑŒĞ±Ğ¾Ğ¼", "albumoptions",
-            "Ğ¸ÑĞ¿Ğ¾Ğ»Ğ½Ğ¸Ñ‚ĞµĞ»ÑŒ", "artist", "Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼", "album", "Ğ¿Ğ»ĞµĞ¹Ğ»Ğ¸ÑÑ‚", "playlist"
-        )
-        return badParts.any { label.contains(it) }
-    }
-
-    private fun clickAlbumExplicitTrackOverflow(root: AccessibilityNodeInfo, strict: Boolean): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val candidates = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-
-            val nodeBounds = boundsOf(node)
-            val clickable = if (node.isClickable) node else clickableParent(node)
-            if (clickable == null) return@mapNotNull null
-            val clickBounds = boundsOf(clickable)
-
-            // Ğ“Ğ»Ğ°Ğ²Ğ½Ğ¾Ğµ Ğ¾Ñ‚Ğ»Ğ¸Ñ‡Ğ¸Ğµ Ğ¾Ñ‚ ÑÑ‚Ğ°Ñ€Ğ¾Ğ³Ğ¾ Ğ°Ğ»Ğ³Ğ¾Ñ€Ğ¸Ñ‚Ğ¼Ğ°: Ğ½Ğµ ĞºĞ»Ğ¸ĞºĞ°ĞµĞ¼ ÑˆĞ¸Ñ€Ğ¾ĞºÑƒÑ ÑÑ‚Ñ€Ğ¾ĞºÑƒ Ñ‚Ñ€ĞµĞºĞ°.
-            // Ğ¢Ğ¾Ğ»ÑŒĞºĞ¾ Ğ¼Ğ°Ğ»ĞµĞ½ÑŒĞºĞ¸Ğ¹ Ğ¿Ñ€Ğ°Ğ²Ñ‹Ğ¹ ÑĞ»ĞµĞ¼ĞµĞ½Ñ‚, Ğ¿Ğ¾Ñ…Ğ¾Ğ¶Ğ¸Ğ¹ Ğ½Ğ° overflow/menu button.
-            if (!isRightSideSmallButton(clickBounds)) return@mapNotNull null
-            if (!isRightSideSmallButton(nodeBounds) && strict) return@mapNotNull null
-
-            val ownLabel = labelOf(node).normalizeYm()
-            val ownId = node.viewIdResourceName.orEmpty().normalizeYm()
-            val clickableLabel = labelOf(clickable).normalizeYm()
-            val clickableId = clickable.viewIdResourceName.orEmpty().normalizeYm()
-            val combined = "$ownLabel $ownId $clickableLabel $clickableId"
-            val row = findLikelyRowContainer(clickable) ?: clickable
-            val rowRaw = labelWithChildren(row)
-            val rowLabel = rowRaw.normalizeYm()
-            val hasDuration = rowRaw.contains(Regex("""\b\d{1,2}:\d{2}\b"""))
-
-            val explicitMenuSignal = hasOverflowSignal(combined)
-            if (strict && !explicitMenuSignal) return@mapNotNull null
-
-            var score = 0
-            if (explicitMenuSignal) score += 140
-            if (hasDuration) score += 55
-            if (node.className?.toString().orEmpty().lowercase().contains("imagebutton")) score += 35
-            if (node.className?.toString().orEmpty().lowercase().contains("imageview")) score += 15
-            if (clickable === node) score += 20
-            if (row.isSelected || row.isFocused || row.isAccessibilityFocused || node.isSelected || node.isFocused || node.isAccessibilityFocused) score += 75
-            score += albumRowPositionScore(clickBounds)
-            score -= unsafeAlbumRowPenalty(clickBounds, rowLabel, hasDuration)
-            score -= excludedOverflowScore(rowLabel)
-
-            // Ğ‘ĞµĞ· ÑĞ²Ğ½Ğ¾Ğ³Ğ¾ ÑĞ¸Ğ³Ğ½Ğ°Ğ»Ğ° Ğ¼ĞµĞ½Ñ Ğ½ĞµĞ»ÑŒĞ·Ñ Ğ½Ğ°Ğ¶Ğ¸Ğ¼Ğ°Ñ‚ÑŒ Ğ´Ğ°Ğ¶Ğµ ĞµÑĞ»Ğ¸ Ğ¿Ğ¾Ğ·Ğ¸Ñ†Ğ¸Ñ Ğ¿Ğ¾Ñ…Ğ¾Ğ¶Ğ°: ÑÑ‚Ğ¾ Ğ¸ Ğ·Ğ°Ğ¿ÑƒÑĞºĞ°Ğ»Ğ¾ ÑĞ¾ÑĞµĞ´Ğ½Ğ¸Ğµ Ñ‚Ñ€ĞµĞºĞ¸.
-            if (!explicitMenuSignal && score < 130) return@mapNotNull null
-
-            val threshold = if (strict) 160 else 120
-            if (score >= threshold) Candidate(clickable, clickBounds, score, combined.ifBlank { rowRaw.take(80) }) else null
-        }
-            .distinctBy { "${it.bounds.left}:${it.bounds.top}:${it.bounds.right}:${it.bounds.bottom}" }
-            .sortedWith(compareByDescending<Candidate> { it.score }.thenBy { abs(it.bounds.centerY() - preferredAlbumRowY()) })
-
-        val target = candidates.firstOrNull() ?: return false
-        return target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-    }
-
-    private fun clickAlbumExplicitTrackOverflowNearCurrentRow(root: AccessibilityNodeInfo): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val currentRows = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            if (!node.isSelected && !node.isFocused && !node.isAccessibilityFocused) return@mapNotNull null
-            val row = findLikelyRowContainer(node) ?: node
-            val r = boundsOf(row)
-            if (!isAlbumTrackRowBand(r)) return@mapNotNull null
-            r
-        }
-        val currentRow = currentRows.minByOrNull { abs(it.centerY() - preferredAlbumRowY()) } ?: return false
-
-        val candidates = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            val clickable = if (node.isClickable) node else clickableParent(node)
-            if (clickable == null) return@mapNotNull null
-            val r = boundsOf(clickable)
-            if (!isRightSideSmallButton(r)) return@mapNotNull null
-            if (abs(r.centerY() - currentRow.centerY()) > dp(42)) return@mapNotNull null
-
-            val label = (labelOf(node) + " " + labelOf(clickable)).normalizeYm()
-            val id = (node.viewIdResourceName.orEmpty() + " " + clickable.viewIdResourceName.orEmpty()).normalizeYm()
-            val combined = "$label $id"
-            if (!hasOverflowSignal(combined)) return@mapNotNull null
-
-            var score = 180
-            score += (50 - abs(r.centerY() - currentRow.centerY()) / dp(2)).coerceAtLeast(0)
-            score += albumRowPositionScore(r)
-            Candidate(clickable, r, score, combined)
-        }
-            .distinctBy { "${it.bounds.left}:${it.bounds.top}:${it.bounds.right}:${it.bounds.bottom}" }
-            .sortedByDescending { it.score }
-
-        val target = candidates.firstOrNull() ?: return false
-        return target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-    }
-
-    private fun hasOverflowSignal(text: String): Boolean {
-        val t = text.normalizeYm()
-        return t.contains("ĞµÑ‰Ğµ") || t.contains("ĞµÑ‰Ñ‘") || t.contains("more") ||
-            t.contains("overflow") || t.contains("menu") || t.contains("options") ||
-            t.contains("Ğ´ĞµĞ¹ÑÑ‚Ğ²Ğ¸Ñ") || t.contains("Ğ´Ñ€ÑƒĞ³Ğ¸ĞµĞ´ĞµĞ¹ÑÑ‚Ğ²Ğ¸Ñ") ||
-            t.contains("Ğ¾Ñ‚ĞºÑ€Ñ‹Ñ‚ÑŒĞ¼ĞµĞ½Ñ") || t.contains("ĞºĞ¾Ğ½Ñ‚ĞµĞºÑÑ‚Ğ½Ğ¾ĞµĞ¼ĞµĞ½Ñ")
-    }
-
-    private fun isRightSideSmallButton(r: Rect): Boolean {
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels
-        val h = dm.heightPixels
-        val width = r.width()
-        val height = r.height()
-        val small = width in dp(16)..dp(112) && height in dp(16)..dp(112)
-        val right = r.centerX() > w * 0.64
-        val safeVertical = r.centerY() in (h * 0.24).toInt()..(h * 0.68).toInt()
-        return small && right && safeVertical
-    }
-
-    private fun isAlbumTrackRowBand(r: Rect): Boolean {
-        val h = resources.displayMetrics.heightPixels
-        return r.centerY() in (h * 0.24).toInt()..(h * 0.68).toInt() && r.height() in dp(32)..dp(128)
-    }
-
-    private fun clickAlbumTrackRowMenuByNodes(root: AccessibilityNodeInfo, strict: Boolean): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val candidates = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            val clickable = if (node.isClickable) node else clickableParent(node)
-            if (clickable == null) return@mapNotNull null
-
-            val r = boundsOf(clickable)
-            if (!isSafeAlbumRowRightSide(r)) return@mapNotNull null
-
-            val label = labelOf(node).normalizeYm()
-            val id = node.viewIdResourceName.orEmpty().normalizeYm()
-            val className = node.className?.toString().orEmpty().lowercase()
-            val row = findLikelyRowContainer(clickable)
-            val rowRaw = labelWithChildren(row ?: clickable)
-            val rowLabel = rowRaw.normalizeYm()
-            val hasDuration = rowRaw.contains(Regex("\\b\\d{1,2}:\\d{2}\\b"))
-
-            var score = albumRowPositionScore(r)
-            if (id.contains("more") || id.contains("overflow") || id.contains("menu")) score += 90
-            if (label.contains("ĞµÑ‰Ğµ") || label.contains("ĞµÑ‰Ñ‘") || label.contains("more") || label.contains("Ğ¼ĞµĞ½Ñ") || label.contains("options")) score += 80
-            if (className.contains("imagebutton") || className.contains("imageview")) score += 10
-            if (hasDuration) score += 55
-            if (node.isSelected || node.isFocused || node.isAccessibilityFocused || (row?.isSelected == true) || (row?.isFocused == true)) score += 65
-            if (r.width() <= dp(96) && r.height() <= dp(96)) score += 15
-
-            score -= unsafeAlbumRowPenalty(r, rowLabel, hasDuration)
-            score -= excludedOverflowScore(label)
-
-            val threshold = if (strict) 85 else 55
-            if (score >= threshold) Candidate(clickable, r, score, label.ifBlank { id.ifBlank { rowLabel.take(60) } }) else null
-        }
-            .distinctBy { "${it.bounds.left}:${it.bounds.top}:${it.bounds.right}:${it.bounds.bottom}" }
-            .sortedWith(compareByDescending<Candidate> { it.score }.thenBy { abs(it.bounds.centerY() - preferredAlbumRowY()) })
-
-        val target = candidates.firstOrNull() ?: return false
-        return target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-    }
-
-    private fun clickSelectedOrFocusedRowMenu(root: AccessibilityNodeInfo): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val rows = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            if (!node.isSelected && !node.isFocused && !node.isAccessibilityFocused) return@mapNotNull null
-            val row = findLikelyRowContainer(node) ?: node
-            val r = boundsOf(row)
-            val h = resources.displayMetrics.heightPixels
-            if (r.centerY() < h * 0.24 || r.centerY() > h * 0.66) return@mapNotNull null
-            r
-        }
-
-        val best = rows.minByOrNull { abs(it.centerY() - preferredAlbumRowY()) } ?: return false
-        return tap(resources.displayMetrics.widthPixels - dp(32), best.centerY())
-    }
-
-    private fun isSafeAlbumRowRightSide(r: Rect): Boolean {
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels
-        val h = dm.heightPixels
-        val width = r.width()
-        val height = r.height()
-        val iconOrCellSized = width in dp(16)..dp(180) && height in dp(16)..dp(120)
-        val rightSide = r.centerX() > w * 0.60
-        val notHeader = r.centerY() > h * 0.24
-        val notRecommendations = r.centerY() < h * 0.68
-        return iconOrCellSized && rightSide && notHeader && notRecommendations
-    }
-
-    private fun albumRowPositionScore(r: Rect): Int {
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels
-        val h = dm.heightPixels
-        var score = 0
-        if (r.centerX() > w * 0.72) score += 35
-        if (r.centerX() > w * 0.84) score += 35
-        if (r.centerY() in (h * 0.30).toInt()..(h * 0.64).toInt()) score += 40
-        score += (60 - (abs(r.centerY() - preferredAlbumRowY()) / dp(8))).coerceAtLeast(0)
-        return score
-    }
-
-    private fun unsafeAlbumRowPenalty(r: Rect, label: String, hasDuration: Boolean): Int {
-        val h = resources.displayMetrics.heightPixels
-        var penalty = 0
-        if (r.centerY() < h * 0.24) penalty += 200
-        if (r.centerY() > h * 0.68) penalty += 220
-        if (!hasDuration && (label.contains("Ğ°Ğ»ÑŒĞ±Ğ¾Ğ¼") || label.contains("album"))) penalty += 140
-        if (label.contains("Ñ€ĞµĞºĞ¾Ğ¼ĞµĞ½Ğ´Ğ°") || label.contains("recommend") || label.contains("Ğ¿Ğ¾Ñ…Ğ¾Ğ¶") || label.contains("Ğ²Ğ°Ğ¼Ğ¼Ğ¾Ğ¶ĞµÑ‚Ğ¿Ğ¾Ğ½Ñ€Ğ°Ğ²")) penalty += 260
-        if (label.contains("Ğ¿Ğ»ĞµĞ¹Ğ»Ğ¸ÑÑ‚") || label.contains("playlist")) penalty += 120
-        if (label.contains("Ğ¸ÑĞ¿Ğ¾Ğ»Ğ½Ğ¸Ñ‚ĞµĞ»ÑŒ") || label.contains("artist")) penalty += 90
-        if (label.contains("Ğ¿ĞµÑ€ĞµĞ¼ĞµÑˆĞ°Ñ‚ÑŒ") || label.contains("shuffle")) penalty += 120
-        if (label.contains("ÑĞºĞ°Ñ‡Ğ°Ñ‚ÑŒĞ°Ğ»ÑŒĞ±Ğ¾Ğ¼") || label.contains("downloadalbum")) penalty += 120
-        if (label.contains("Ğ¾Ğ±Ğ»Ğ¾Ğ¶ĞºĞ°") || label.contains("cover")) penalty += 80
-        return penalty
-    }
-
-    private fun preferredAlbumRowY(): Int = (resources.displayMetrics.heightPixels * 0.48f).toInt()
-
-    private fun tapAlbumTrackRowRightMenu(centerBias: Float): Boolean {
-        val dm = resources.displayMetrics
-        val y = (dm.heightPixels * centerBias).toInt().coerceIn((dm.heightPixels * 0.26f).toInt(), (dm.heightPixels * 0.64f).toInt())
-        return tap(dm.widthPixels - dp(32), y)
-    }
-
-    private fun longPressAlbumTrackRow(centerBias: Float): Boolean {
-        val dm = resources.displayMetrics
-        val y = (dm.heightPixels * centerBias).toInt().coerceIn((dm.heightPixels * 0.28f).toInt(), (dm.heightPixels * 0.62f).toInt())
-        return gesture((dm.widthPixels * 0.42f).toInt(), y, durationMs = 700)
-    }
-
-    private fun clickTrackContextMenuBySemantics(root: AccessibilityNodeInfo): Boolean {
-        val semanticWords = listOf(
-            "ĞµÑ‰Ñ‘", "ĞµÑ‰Ğµ", "more", "moreoptions", "options",
-            "Ğ´ĞµĞ¹ÑÑ‚Ğ²Ğ¸Ñ", "Ğ´Ñ€ÑƒĞ³Ğ¸ĞµĞ´ĞµĞ¹ÑÑ‚Ğ²Ğ¸Ñ", "Ğ¼ĞµĞ½Ñ", "Ğ¾Ñ‚ĞºÑ€Ñ‹Ñ‚ÑŒĞ¼ĞµĞ½Ñ",
-            "ĞºĞ¾Ğ½Ñ‚ĞµĞºÑÑ‚Ğ½Ğ¾ĞµĞ¼ĞµĞ½Ñ", "contextmenu", "overflow"
-        )
-
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val candidates = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            val clickable = if (node.isClickable) node else clickableParent(node)
-            if (clickable == null) return@mapNotNull null
-            val label = labelOf(node).normalizeYm()
-            val id = node.viewIdResourceName.orEmpty().normalizeYm()
-            val className = node.className?.toString().orEmpty().lowercase()
-            val r = boundsOf(clickable)
-            var score = 0
-
-            if (semanticWords.any { label.contains(it) }) score += 120
-            if (semanticWords.any { id.contains(it) }) score += 110
-            if (id.contains("more") || id.contains("overflow") || id.contains("menu")) score += 90
-            if (className.contains("imagebutton") || className.contains("imageview")) score += 10
-            score += overflowPositionScore(r)
-            score -= excludedOverflowScore(label)
-
-            if (score >= 90) Candidate(clickable, r, score, label.ifBlank { id }) else null
-        }.sortedWith(compareByDescending<Candidate> { it.score }.thenBy { it.bounds.top }.thenByDescending { it.bounds.right })
-
-        val target = candidates.firstOrNull() ?: return false
-        return target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-    }
-
-    private fun clickTrackContextMenuByScore(root: AccessibilityNodeInfo): Boolean {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-
-        val candidates = all.mapNotNull { node ->
-            if (!node.isVisibleToUser) return@mapNotNull null
-            val clickable = if (node.isClickable) node else clickableParent(node)
-            if (clickable == null || clickable !== node && !node.isFocusable) return@mapNotNull null
-            val r = boundsOf(clickable)
-            val label = labelOf(clickable).normalizeYm()
-            val id = clickable.viewIdResourceName.orEmpty().normalizeYm()
-
-            val width = r.width()
-            val height = r.height()
-            val iconSized = width in dp(24)..dp(96) && height in dp(24)..dp(96)
-            if (!iconSized) return@mapNotNull null
-
-            var score = overflowPositionScore(r)
-            if (id.contains("menu") || id.contains("more") || id.contains("overflow")) score += 65
-            score -= excludedOverflowScore(label)
-
-            if (score > 45) Candidate(clickable, r, score, label.ifBlank { id }) else null
-        }.distinctBy { "${it.bounds.left}:${it.bounds.top}:${it.bounds.right}:${it.bounds.bottom}" }
-            .sortedWith(compareByDescending<Candidate> { it.score }.thenBy { it.bounds.top }.thenByDescending { it.bounds.right })
-
-        val target = candidates.firstOrNull() ?: return false
-        return target.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-    }
-
-    private fun overflowPositionScore(r: Rect): Int {
-        val w = resources.displayMetrics.widthPixels
-        val h = resources.displayMetrics.heightPixels
-        var score = 0
-        if (r.centerX() > w * 0.72) score += 45
-        if (r.centerX() > w * 0.86) score += 30
-        if (r.centerY() in dp(44)..(h * 0.42).toInt()) score += 40
-        if (r.centerY() in (h * 0.42).toInt()..(h * 0.72).toInt()) score += 15
-        if (r.centerY() > h * 0.80) score -= 40
-        if (abs(r.width() - r.height()) < dp(24)) score += 10
-        return score
-    }
-
-    private fun excludedOverflowScore(label: String): Int {
-        val bad = listOf(
-            "Ğ½Ğ°Ğ·Ğ°Ğ´", "back", "play", "pause", "Ğ¿Ğ°ÑƒĞ·Ğ°", "Ğ²Ğ¾ÑĞ¿Ñ€Ğ¾Ğ¸Ğ·", "ÑÑ‚Ğ¾Ğ¿",
-            "like", "Ğ»Ğ°Ğ¹Ğº", "Ğ½Ñ€Ğ°Ğ²Ğ¸Ñ‚ÑÑ", "share", "Ğ¿Ğ¾Ğ´ĞµĞ»Ğ¸Ñ‚ÑŒÑÑ", "search", "Ğ¿Ğ¾Ğ¸ÑĞº",
-            "close", "Ğ·Ğ°ĞºÑ€Ñ‹Ñ‚ÑŒ", "shuffle", "Ğ¿ĞµÑ€ĞµĞ¼ĞµÑˆ", "repeat", "Ğ¿Ğ¾Ğ²Ñ‚Ğ¾Ñ€"
-        )
-        return if (bad.any { label.contains(it) }) 100 else 0
-    }
-
-    private fun tapTopRightOverflow(): Boolean {
-        val dm = resources.displayMetrics
-        return tap(dm.widthPixels - dp(28), dp(64))
-    }
-
-    private fun tapUpperRightOverflow(): Boolean {
-        val dm = resources.displayMetrics
-        return tap(dm.widthPixels - dp(28), dp(112))
-    }
-
-    private fun tapMiddleRightOverflow(): Boolean {
-        val dm = resources.displayMetrics
-        return tap(dm.widthPixels - dp(28), (dm.heightPixels * 0.34f).toInt())
-    }
-
-    private fun tapLowerRightOverflow(): Boolean {
-        val dm = resources.displayMetrics
-        return tap(dm.widthPixels - dp(28), (dm.heightPixels * 0.58f).toInt())
-    }
-
-    private fun longPressLikelyTrackArea(): Boolean {
-        val dm = resources.displayMetrics
-        return gesture(dm.widthPixels / 2, (dm.heightPixels * 0.42f).toInt(), durationMs = 650)
-    }
-
-    private fun tap(x: Int, y: Int): Boolean = gesture(x, y, durationMs = 80)
-
-    private fun gesture(x: Int, y: Int, durationMs: Long): Boolean {
-        val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs))
-            .build()
-        return dispatchGesture(gesture, null, null)
-    }
-
-    private fun clickableParent(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        var cur = node?.parent
-        repeat(8) {
-            if (cur == null) return null
-            if (cur!!.isClickable) return cur
-            cur = cur!!.parent
-        }
-        return null
-    }
-
-    private fun findLikelyRowContainer(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        var best: AccessibilityNodeInfo? = node
-        var cur = node.parent
-        repeat(5) {
-            if (cur == null) return best
-            val r = boundsOf(cur!!)
-            val h = r.height()
-            val w = r.width()
-            if (h in dp(36)..dp(112) && w > resources.displayMetrics.widthPixels * 0.45) {
-                best = cur
-            }
-            cur = cur!!.parent
-        }
-        return best
-    }
-
-    private fun labelOf(node: AccessibilityNodeInfo): String {
-        val parts = listOf(
-            node.text?.toString().orEmpty(),
-            node.contentDescription?.toString().orEmpty(),
-            node.viewIdResourceName.orEmpty()
-        )
-        return parts.filter { it.isNotBlank() }.joinToString(" ")
-    }
-
-    private fun labelWithChildren(node: AccessibilityNodeInfo): String {
-        val out = StringBuilder(labelOf(node))
-        fun walk(n: AccessibilityNodeInfo, depth: Int) {
-            if (depth > 3) return
-            for (i in 0 until n.childCount) {
-                val child = n.getChild(i) ?: continue
-                val label = labelOf(child)
-                if (label.isNotBlank()) out.append(' ').append(label)
-                walk(child, depth + 1)
-            }
-        }
-        walk(node, 0)
-        return out.toString()
-    }
-
-    private fun String.normalizeYm(): String = lowercase()
-        .replace('Ñ‘', 'Ğµ')
-        .replace(Regex("[^a-zĞ°-Ñ0-9]+"), "")
-
-    private fun String.stripExplicitTrackMarkers(): String {
-        var out = this
-        val markers = listOf(
-            "Ñ‚Ñ€ĞµĞºÑĞ¾Ğ´ĞµÑ€Ğ¶Ğ¸Ñ‚Ğ½ĞµĞ½Ğ¾Ñ€Ğ¼Ğ°Ñ‚Ğ¸Ğ²Ğ½ÑƒÑĞ»ĞµĞºÑĞ¸ĞºÑƒ",
-            "ÑĞ¾Ğ´ĞµÑ€Ğ¶Ğ¸Ñ‚Ğ½ĞµĞ½Ğ¾Ñ€Ğ¼Ğ°Ñ‚Ğ¸Ğ²Ğ½ÑƒÑĞ»ĞµĞºÑĞ¸ĞºÑƒ",
-            "Ğ½ĞµĞ½Ğ¾Ñ€Ğ¼Ğ°Ñ‚Ğ¸Ğ²Ğ½Ğ°ÑĞ»ĞµĞºÑĞ¸ĞºĞ°",
-            "Ğ½ĞµĞ½Ğ¾Ñ€Ğ¼Ğ°Ñ‚Ğ¸Ğ²Ğ½ÑƒÑĞ»ĞµĞºÑĞ¸ĞºÑƒ",
-            "Ğ½ĞµĞ½Ğ¾Ñ€Ğ¼Ğ°Ñ‚Ğ¸Ğ²Ğ½Ğ¾Ğ¹Ğ»ĞµĞºÑĞ¸ĞºĞ¾Ğ¹",
-            "Ğ¼Ğ°Ñ‚ĞµÑ€Ğ½Ñ‹ĞµÑĞ»Ğ¾Ğ²Ğ°",
-            "Ğ²Ğ¾ÑĞºĞ»Ğ¸Ñ†Ğ°Ñ‚ĞµĞ»ÑŒĞ½Ñ‹Ğ¹Ğ·Ğ½Ğ°ĞºĞ²ĞºÑ€ÑƒĞ¶Ğ¾Ñ‡ĞºĞµ",
-            "Ğ²Ğ¾ÑĞºĞ»Ğ¸Ñ†Ğ°Ñ‚ĞµĞ»ÑŒĞ½Ñ‹Ğ¹Ğ·Ğ½Ğ°Ğº",
-            "Ğ·Ğ½Ğ°Ñ‡Ğ¾ĞºĞ²Ğ¾ÑĞºĞ»Ğ¸Ñ†Ğ°Ñ‚ĞµĞ»ÑŒĞ½Ñ‹Ğ¹",
-            "parentaladvisory",
-            "explicitlyrics",
-            "explicitcontent",
-            "explicit"
-        )
-        markers.forEach { marker -> out = out.replace(marker, "") }
-        return out
-    }
-
-    private fun boundsOf(node: AccessibilityNodeInfo): Rect = Rect().also { node.getBoundsInScreen(it) }
-
-    private fun updateHierarchyDump(root: AccessibilityNodeInfo) {
-        val all = mutableListOf<AccessibilityNodeInfo>()
-        collect(root, all)
-        lastHierarchyDump = all.asSequence()
-            .mapIndexedNotNull { index, node ->
-                if (!node.isVisibleToUser) return@mapIndexedNotNull null
-                val rawLabel = labelOf(node).trim()
-                if (rawLabel.isBlank()) return@mapIndexedNotNull null
-                val r = boundsOf(node)
-                val clickable = if (node.isClickable) " clickable" else ""
-                val selected = when {
-                    node.isSelected -> " selected"
-                    node.isFocused -> " focused"
-                    node.isAccessibilityFocused -> " accessibilityFocused"
-                    else -> ""
-                }
-                "#$index ${rawLabel.take(90)} [$r]$clickable$selected"
-            }
-            .distinct()
-            .take(80)
-            .joinToString("\n")
-    }
-
-    private fun collect(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
-        out += node
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { collect(it, out) }
-        }
-    }
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-
-    private data class Candidate(
-        val node: AccessibilityNodeInfo,
-        val bounds: Rect,
-        val score: Int,
-        val label: String
-    )
-}
+        val albumRowMode = preferT×½ºêÚ$z{-®éÜj×R"’ÇÂÆ&VÂæ6öçF–ç2‚-Í]İâ"’ÇÂÆ&VÂæ6öçF–ç2‚&÷F–öç2"’’66÷&R³Òƒ Ğ¢–b†6Æ74æÖRæ6öçF–ç2‚&–ÖvV'WGFöâ"’ÇÂ6Æ74æÖRæ6öçF–ç2‚&–ÖvWf–Wr"’’66÷&R³Ò Ğ¢–b††4GW&F–öâ’66÷&R³ÒSPĞ¢–b†æöFRæ—56VÆV7FVBÇÂæöFRæ—4fö7W6VBÇÂæöFRæ—466W76–&–Æ—G”fö7W6VBÇÂ‡&÷sòæ—56VÆV7FVBÓÒG'VR’ÇÂ‡&÷sòæ—4fö7W6VBÓÒG'VR’’66÷&R³ÒcPĞ¢–b‡"çv–GF‚‚’ÃÒGƒ“b’bb"æ†V–v‡B‚’ÃÒGƒ“b’’66÷&R³ÒPĞ Ğ¢66÷&RÓÒVç6fTÆ'VÕ&÷uVæÇG’‡"Â&÷tÆ&VÂÂ†4GW&F–öâĞ¢66÷&RÓÒW†6ÇVFVD÷fW&fÆ÷u66÷&R†Æ&VÂĞ Ğ¢fÂF‡&W6†öÆBÒ–b‡7G&–7B’ƒRVÇ6RSPĞ¢–b‡66÷&RãÒF‡&W6†öÆB’6æF–FFR†6Æ–6¶&ÆRÂ"Â66÷&RÂÆ&VÂæ–d&Ææ²²–Bæ–d&Ææ²²&÷tÆ&VÂçF¶Rƒc’ÒÒ’VÇ6RçVÆÀĞ¢ĞĞ¢æF—7F–æ7D'’²"G¶—Bæ&÷VæG2æÆVgGÓ¢G¶—Bæ&÷VæG2çF÷Ó¢G¶—Bæ&÷VæG2ç&–v‡GÓ¢G¶—Bæ&÷VæG2æ&÷GFö×Ò"ĞĞ¢ç6÷'FVEv—F‚†6ö×&T'”FW66VæF–æsÄ6æF–FFSâ²—Bç66÷&RÒçF†Vä'’²'2†—Bæ&÷VæG2æ6VçFW%’‚’Ò&VfW'&VDÆ'VÕ&÷u’‚’’ÒĞ Ğ¢fÂF&vWBÒ6æF–FFW2æf—'7D÷$çVÆÂ‚’ó¢&WGW&âfÇ6PĞ¢&WGW&âF&vWBææöFRçW&f÷&Ô7F–öâ„66W76–&–Æ—G”æöFT–æfòä5D”ôåô4Ä”4²Ğ¢ĞĞ Ğ¢&—fFRgVâ6Æ–6µ6VÆV7FVD÷$fö7W6VE&÷tÖVçR‡&ö÷C¢66W76–&–Æ—G”æöFT–æfò“¢&ööÆVâ°Ğ¢fÂÆÂÒ×WF&ÆTÆ—7DöcÄ66W76–&–Æ—G”æöFT–æfóâ‚Ğ¢6öÆÆV7B‡&ö÷BÂÆÂĞ Ğ¢fÂ&÷w2ÒÆÂæÖæ÷DçVÆÂ²æöFRÓàĞ¢–b‚æöFRæ—5f—6–&ÆUFõW6W"’&WGW&äÖæ÷DçVÆÂçVÆÀĞ¢–b‚æöFRæ—56VÆV7FVBbbæöFRæ—4fö7W6VBbbæöFRæ—466W76–&–Æ—G”fö7W6VB’&WGW&äÖæ÷DçVÆÂçVÆÀĞ¢fÂ&÷rÒf–æDÆ–¶VÇ•&÷t6öçF–æW"†æöFR’ó¢æöFPĞ¢fÂ"Ò&÷VæG4öb‡&÷rĞ¢fÂ‚Ò&W6÷W&6W2æF—7Æ”ÖWG&–72æ†V–v‡E—†VÇ0Ğ¢–b‡"æ6VçFW%’‚’Â‚¢ã#BÇÂ"æ6VçFW%’‚’â‚¢ãcb’&WGW&äÖæ÷DçVÆÂçVÆÀĞ¢ Ğ¢ĞĞ Ğ¢fÂ&W7BÒ&÷w2æÖ–ä'”÷$çVÆÂ²'2†—Bæ6VçFW%’‚’Ò&VfW'&VDÆ'VÕ&÷u’‚’’Òó¢&WGW&âfÇ6PĞ¢&WGW&âF‡&W6÷W&6W2æF—7Æ”ÖWG&–72çv–GF…—†VÇ2ÒGƒ3"’Â&W7Bæ6VçFW%’‚’Ğ¢ĞĞ Ğ¢&—fFRgVâ—56fTÆ'VÕ&÷u&–v‡E6–FR‡#¢&V7B“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢fÂrÒFÒçv–GF…—†VÇ0Ğ¢fÂ‚ÒFÒæ†V–v‡E—†VÇ0Ğ¢fÂv–GF‚Ò"çv–GF‚‚Ğ¢fÂ†V–v‡BÒ"æ†V–v‡B‚Ğ¢fÂ–6öä÷$6VÆÅ6—¦VBÒv–GF‚–âGƒb’âæGƒƒ’bb†V–v‡B–âGƒb’âæGƒ#Ğ¢fÂ&–v‡E6–FRÒ"æ6VçFW%‚‚’âr¢ãc Ğ¢fÂæ÷D†VFW"Ò"æ6VçFW%’‚’â‚¢ã#@Ğ¢fÂæ÷E&V6öÖÖVæFF–öç2Ò"æ6VçFW%’‚’Â‚¢ãc€Ğ¢&WGW&â–6öä÷$6VÆÅ6—¦VBbb&–v‡E6–FRbbæ÷D†VFW"bbæ÷E&V6öÖÖVæFF–öç0Ğ¢ĞĞ Ğ¢&—fFRgVâÆ'VÕ&÷u÷6—F–öå66÷&R‡#¢&V7B“¢–çB°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢fÂrÒFÒçv–GF…—†VÇ0Ğ¢fÂ‚ÒFÒæ†V–v‡E—†VÇ0Ğ¢f"66÷&RÒ Ğ¢–b‡"æ6VçFW%‚‚’âr¢ãs"’66÷&R³Ò3PĞ¢–b‡"æ6VçFW%‚‚’âr¢ãƒB’66÷&R³Ò3PĞ¢–b‡"æ6VçFW%’‚’–â†‚¢ã3’çFô–çB‚’ââ†‚¢ãcB’çFô–çB‚’’66÷&R³ÒC Ğ¢66÷&R³ÒƒcÒ†'2‡"æ6VçFW%’‚’Ò&VfW'&VDÆ'VÕ&÷u’‚’’òGƒ‚’’’æ6öW&6TDÆV7BƒĞ¢&WGW&â66÷&PĞ¢ĞĞ Ğ¢&—fFRgVâVç6fTÆ'VÕ&÷uVæÇG’‡#¢&V7BÂÆ&VÃ¢7G&–ærÂ†4GW&F–öã¢&ööÆVâ“¢–çB°Ğ¢fÂ‚Ò&W6÷W&6W2æF—7Æ”ÖWG&–72æ†V–v‡E—†VÇ0Ğ¢f"VæÇG’Ò Ğ¢–b‡"æ6VçFW%’‚’Â‚¢ã#B’VæÇG’³Ò# Ğ¢–b‡"æ6VçFW%’‚’â‚¢ãc‚’VæÇG’³Ò## Ğ¢–b‚†4GW&F–öâbb†Æ&VÂæ6öçF–ç2‚-½ÍíÂ"’ÇÂÆ&VÂæ6öçF–ç2‚&Æ'VÒ"’’’VæÇG’³ÒC Ğ¢–b†Æ&VÂæ6öçF–ç2‚-]­íÍ]İM"’ÇÂÆ&VÂæ6öçF–ç2‚'&V6öÖÖVæB"’ÇÂÆ&VÂæ6öçF–ç2‚-ıí]íb"’ÇÂÆ&VÂæ6öçF–ç2‚--ÍÍím]-ıíİ""’’VæÇG’³Ò#c Ğ¢–b†Æ&VÂæ6öçF–ç2‚-ı½]½""’ÇÂÆ&VÂæ6öçF–ç2‚'Æ–Æ—7B"’’VæÇG’³Ò# Ğ¢–b†Æ&VÂæ6öçF–ç2‚-ıí½İ-]½Â"’ÇÂÆ&VÂæ6öçF–ç2‚&'F—7B"’’VæÇG’³Ò“ Ğ¢–b†Æ&VÂæ6öçF–ç2‚-ı]]Í]-Â"’ÇÂÆ&VÂæ6öçF–ç2‚'6‡VffÆR"’’VæÇG’³Ò# Ğ¢–b†Æ&VÂæ6öçF–ç2‚-­}-Í½ÍíÂ"’ÇÂÆ&VÂæ6öçF–ç2‚&F÷væÆöFÆ'VÒ"’’VæÇG’³Ò# Ğ¢–b†Æ&VÂæ6öçF–ç2‚-í½ím­"’ÇÂÆ&VÂæ6öçF–ç2‚&6÷fW""’’VæÇG’³Òƒ Ğ¢&WGW&âVæÇGĞ¢ĞĞ Ğ¢&—fFRgVâ&VfW'&VDÆ'VÕ&÷u’‚“¢–çBÒ‡&W6÷W&6W2æF—7Æ”ÖWG&–72æ†V–v‡E—†VÇ2¢ãC†b’çFô–çB‚Ğ Ğ¢&—fFRgVâFÆ'VÕG&6µ&÷u&–v‡DÖVçR†6VçFW$&–3¢fÆöB“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢fÂ’Ò†FÒæ†V–v‡E—†VÇ2¢6VçFW$&–2’çFô–çB‚’æ6öW&6T–â‚†FÒæ†V–v‡E—†VÇ2¢ã#fb’çFô–çB‚’Â†FÒæ†V–v‡E—†VÇ2¢ãcFb’çFô–çB‚’Ğ¢&WGW&âF†FÒçv–GF…—†VÇ2ÒGƒ3"’Â’Ğ¢ĞĞ Ğ¢&—fFRgVâÆöæu&W74Æ'VÕG&6µ&÷r†6VçFW$&–3¢fÆöB“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢fÂ’Ò†FÒæ†V–v‡E—†VÇ2¢6VçFW$&–2’çFô–çB‚’æ6öW&6T–â‚†FÒæ†V–v‡E—†VÇ2¢ã#†b’çFô–çB‚’Â†FÒæ†V–v‡E—†VÇ2¢ãc&b’çFô–çB‚’Ğ¢&WGW&âvW7GW&R‚†FÒçv–GF…—†VÇ2¢ãC&b’çFô–çB‚’Â’ÂGW&F–öä×2ÒsĞ¢ĞĞ Ğ¢&—fFRgVâ6Æ–6µG&6´6öçFW‡DÖVçT'•6VÖçF–72‡&ö÷C¢66W76–&–Æ—G”æöFT–æfò“¢&ööÆVâ°Ğ¢fÂ6VÖçF–5v÷&G2ÒÆ—7Döb€Ğ¢-]"Â-]R"Â&Ö÷&R"Â&Ö÷&V÷F–öç2"Â&÷F–öç2"ÀĞ¢-M]--ò"Â-M==]M]--ò"Â-Í]İâ"Â-í-­½-ÍÍ]İâ"ÀĞ¢-­íİ-]­-İí]Í]İâ"Â&6öçFW‡FÖVçR"Â&÷fW&fÆ÷r Ğ¢Ğ Ğ¢fÂÆÂÒ×WF&ÆTÆ—7DöcÄ66W76–&–Æ—G”æöFT–æfóâ‚Ğ¢6öÆÆV7B‡&ö÷BÂÆÂĞ Ğ¢fÂ6æF–FFW2ÒÆÂæÖæ÷DçVÆÂ²æöFRÓàĞ¢–b‚æöFRæ—5f—6–&ÆUFõW6W"’&WGW&äÖæ÷DçVÆÂçVÆÀĞ¢fÂ6Æ–6¶&ÆRÒ–b†æöFRæ—46Æ–6¶&ÆR’æöFRVÇ6R6Æ–6¶&ÆU&VçB†æöFRĞ¢–b†6Æ–6¶&ÆRÓÒçVÆÂ’&WGW&äÖæ÷DçVÆÂçVÆÀĞ¢fÂÆ&VÂÒÆ&VÄöb†æöFR’ææ÷&ÖÆ—¦U–Ò‚Ğ¢fÂ–BÒæöFRçf–Wt–E&W6÷W&6TæÖRæ÷$V×G’‚’ææ÷&ÖÆ—¦U–Ò‚Ğ¢fÂ6Æ74æÖRÒæöFRæ6Æ74æÖSòçFõ7G&–ær‚’æ÷$V×G’‚’æÆ÷vW&66R‚Ğ¢fÂ"Ò&÷VæG4öb†6Æ–6¶&ÆRĞ¢f"66÷&RÒ Ğ Ğ¢–b‡6VÖçF–5v÷&G2æç’²Æ&VÂæ6öçF–ç2†—B’Ò’66÷&R³Ò# Ğ¢–b‡6VÖçF–5v÷&G2æç’²–Bæ6öçF–ç2†—B’Ò’66÷&R³Ò Ğ¢–b†–Bæ6öçF–ç2‚&Ö÷&R"’ÇÂ–Bæ6öçF–ç2‚&÷fW&fÆ÷r"’ÇÂ–Bæ6öçF–ç2‚&ÖVçR"’’66÷&R³Ò“ Ğ¢–b†6Æ74æÖRæ6öçF–ç2‚&–ÖvV'WGFöâ"’ÇÂ6Æ74æÖRæ6öçF–ç2‚&–ÖvWf–Wr"’’66÷&R³Ò Ğ¢66÷&R³Ò÷fW&fÆ÷u÷6—F–öå66÷&R‡"Ğ¢66÷&RÓÒW†6ÇVFVD÷fW&fÆ÷u66÷&R†Æ&VÂĞ Ğ¢–b‡66÷&RãÒ“’6æF–FFR†6Æ–6¶&ÆRÂ"Â66÷&RÂÆ&VÂæ–d&Ææ²²–BÒ’VÇ6RçVÆÀĞ¢Òç6÷'FVEv—F‚†6ö×&T'”FW66VæF–æsÄ6æF–FFSâ²—Bç66÷&RÒçF†Vä'’²—Bæ&÷VæG2çF÷ÒçF†Vä'”FW66VæF–ær²—Bæ&÷VæG2ç&–v‡BÒĞ Ğ¢fÂF&vWBÒ6æF–FFW2æf—'7D÷$çVÆÂ‚’ó¢&WGW&âfÇ6PĞ¢&WGW&âF&vWBææöFRçW&f÷&Ô7F–öâ„66W76–&–Æ—G”æöFT–æfòä5D”ôåô4Ä”4²Ğ¢ĞĞ Ğ¢&—fFRgVâ6Æ–6µG&6´6öçFW‡DÖVçT'•66÷&R‡&ö÷C¢66W76–&–Æ—G”æöFT–æfò“¢&ööÆVâ°Ğ¢fÂÆÂÒ×WF&ÆTÆ—7DöcÄ66W76–&–Æ—G”æöFT–æfóâ‚Ğ¢6öÆÆV7B‡&ö÷BÂÆÂĞ Ğ¢fÂ6æF–FFW2ÒÆÂæÖæ÷DçVÆÂ²æöFRÓàĞ¢–b‚æöFRæ—5f—6–&ÆUFõW6W"’&WGW&äÖæ÷DçVÆÂçVÆÀĞ¢fÂ6Æ–6¶&ÆRÒ–b†æöFRæ—46Æ–6¶&ÆR’æöFRVÇ6R6Æ–6¶&ÆU&VçB†æöFRĞ¢–b†6Æ–6¶&ÆRÓÒçVÆÂÇÂ6Æ–6¶&ÆRÓÒæöFRbbæöFRæ—4fö7W6&ÆR’&WGW&äÖæ÷DçVÆÂçVÆÀĞ¢fÂ"Ò&÷VæG4öb†6Æ–6¶&ÆRĞ¢fÂÆ&VÂÒÆ&VÄöb†6Æ–6¶&ÆR’ææ÷&ÖÆ—¦U–Ò‚Ğ¢fÂ–BÒ6Æ–6¶&ÆRçf–Wt–E&W6÷W&6TæÖRæ÷$V×G’‚’ææ÷&ÖÆ—¦U–Ò‚Ğ Ğ¢fÂv–GF‚Ò"çv–GF‚‚Ğ¢fÂ†V–v‡BÒ"æ†V–v‡B‚Ğ¢fÂ–6öå6—¦VBÒv–GF‚–âGƒ#B’âæGƒ“b’bb†V–v‡B–âGƒ#B’âæGƒ“bĞ¢–b‚–6öå6—¦VB’&WGW&äÖæ÷DçVÆÂçVÆÀĞ Ğ¢f"66÷&RÒ÷fW&fÆ÷u÷6—F–öå66÷&R‡"Ğ¢–b†–Bæ6öçF–ç2‚&ÖVçR"’ÇÂ–Bæ6öçF–ç2‚&Ö÷&R"’ÇÂ–Bæ6öçF–ç2‚&÷fW&fÆ÷r"’’66÷&R³ÒcPĞ¢66÷&RÓÒW†6ÇVFVD÷fW&fÆ÷u66÷&R†Æ&VÂĞ Ğ¢–b‡66÷&RâCR’6æF–FFR†6Æ–6¶&ÆRÂ"Â66÷&RÂÆ&VÂæ–d&Ææ²²–BÒ’VÇ6RçVÆÀĞ¢ÒæF—7F–æ7D'’²"G¶—Bæ&÷VæG2æÆVgGÓ¢G¶—Bæ&÷VæG2çF÷Ó¢G¶—Bæ&÷VæG2ç&–v‡GÓ¢G¶—Bæ&÷VæG2æ&÷GFö×Ò"ĞĞ¢ç6÷'FVEv—F‚†6ö×&T'”FW66VæF–æsÄ6æF–FFSâ²—Bç66÷&RÒçF†Vä'’²—Bæ&÷VæG2çF÷ÒçF†Vä'”FW66VæF–ær²—Bæ&÷VæG2ç&–v‡BÒĞ Ğ¢fÂF&vWBÒ6æF–FFW2æf—'7D÷$çVÆÂ‚’ó¢&WGW&âfÇ6PĞ¢&WGW&âF&vWBææöFRçW&f÷&Ô7F–öâ„66W76–&–Æ—G”æöFT–æfòä5D”ôåô4Ä”4²Ğ¢ĞĞ Ğ¢&—fFRgVâ÷fW&fÆ÷u÷6—F–öå66÷&R‡#¢&V7B“¢–çB°Ğ¢fÂrÒ&W6÷W&6W2æF—7Æ”ÖWG&–72çv–GF…—†VÇ0Ğ¢fÂ‚Ò&W6÷W&6W2æF—7Æ”ÖWG&–72æ†V–v‡E—†VÇ0Ğ¢f"66÷&RÒ Ğ¢–b‡"æ6VçFW%‚‚’âr¢ãs"’66÷&R³ÒCPĞ¢–b‡"æ6VçFW%‚‚’âr¢ãƒb’66÷&R³Ò3 Ğ¢–b‡"æ6VçFW%’‚’–âGƒCB’ââ†‚¢ãC"’çFô–çB‚’’66÷&R³ÒC Ğ¢–b‡"æ6VçFW%’‚’–â†‚¢ãC"’çFô–çB‚’ââ†‚¢ãs"’çFô–çB‚’’66÷&R³ÒPĞ¢–b‡"æ6VçFW%’‚’â‚¢ãƒ’66÷&RÓÒC Ğ¢–b†'2‡"çv–GF‚‚’Ò"æ†V–v‡B‚’’ÂGƒ#B’’66÷&R³Ò Ğ¢&WGW&â66÷&PĞ¢ĞĞ Ğ¢&—fFRgVâW†6ÇVFVD÷fW&fÆ÷u66÷&R†Æ&VÃ¢7G&–ær“¢–çB°Ğ¢fÂ&BÒÆ—7Döb€Ğ¢-İ}B"Â&&6²"Â'Æ’"Â'W6R"Â-ı=}"Â--íıír"Â--íò"ÀĞ¢&Æ–¶R"Â-½¢"Â-İ--ò"Â'6†&R"Â-ıíM]½-Íò"Â'6V&6‚"Â-ıí¢"ÀĞ¢&6Æ÷6R"Â-}­½-Â"Â'6‡VffÆR"Â-ı]]Í]‚"Â'&WVB"Â-ıí--í Ğ¢Ğ¢&WGW&â–b†&Bæç’²Æ&VÂæ6öçF–ç2†—B’Ò’VÇ6R Ğ¢ĞĞ Ğ¢&—fFRgVâFF÷&–v‡D÷fW&fÆ÷r‚“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢&WGW&âF†FÒçv–GF…—†VÇ2ÒGƒ#‚’ÂGƒcB’Ğ¢ĞĞ Ğ¢&—fFRgVâFWW%&–v‡D÷fW&fÆ÷r‚“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢&WGW&âF†FÒçv–GF…—†VÇ2ÒGƒ#‚’ÂGƒ"’Ğ¢ĞĞ Ğ¢&—fFRgVâFÖ–FFÆU&–v‡D÷fW&fÆ÷r‚“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢&WGW&âF†FÒçv–GF…—†VÇ2ÒGƒ#‚’Â†FÒæ†V–v‡E—†VÇ2¢ã3Fb’çFô–çB‚’Ğ¢ĞĞ Ğ¢&—fFRgVâFÆ÷vW%&–v‡D÷fW&fÆ÷r‚“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢&WGW&âF†FÒçv–GF…—†VÇ2ÒGƒ#‚’Â†FÒæ†V–v‡E—†VÇ2¢ãS†b’çFô–çB‚’Ğ¢ĞĞ Ğ¢&—fFRgVâÆöæu&W74Æ–¶VÇ•G&6´&V‚“¢&ööÆVâ°Ğ¢fÂFÒÒ&W6÷W&6W2æF—7Æ”ÖWG&–70Ğ¢&WGW&âvW7GW&R†FÒçv–GF…—†VÇ2ò"Â†FÒæ†V–v‡E—†VÇ2¢ãC&b’çFô–çB‚’ÂGW&F–öä×2ÒcSĞ¢ĞĞ Ğ¢&—fFRgVâF‡ƒ¢–çBÂ“¢–çB“¢&ööÆVâÒvW7GW&R‡‚Â’ÂGW&F–öä×2ÒƒĞ Ğ¢&—fFRgVâvW7GW&R‡ƒ¢–çBÂ“¢–çBÂGW&F–öä×3¢Æöær“¢&ööÆVâ°Ğ¢fÂF‚ÒF‚‚’æÇ’²Ö÷fUFò‡‚çFôfÆöB‚’Â’çFôfÆöB‚’’ĞĞ¢fÂvW7GW&RÒvW7GW&TFW67&—F–öâä'V–ÆFW"‚Ğ¢æFE7G&ö¶R„vW7GW&TFW67&—F–öâå7G&ö¶TFW67&—F–öâ‡F‚ÂÂGW&F–öä×2’Ğ¢æ'V–ÆB‚Ğ¢&WGW&âF—7F6„vW7GW&R†vW7GW&RÂçVÆÂÂçVÆÂĞ¢ĞĞ Ğ¢&—fFRgVâ6Æ–6¶&ÆU&VçB†æöFS¢66W76–&–Æ—G”æöFT–æfóò“¢66W76–&–Æ—G”æöFT–æfóò°Ğ¢f"7W"ÒæöFSòç&Vç@Ğ¢&WVBƒ‚’°Ğ¢–b†7W"ÓÒçVÆÂ’&WGW&âçVÆÀĞ¢–b†7W"æ—46Æ–6¶&ÆR’&WGW&â7W Ğ¢7W"Ò7W"ç&Vç@Ğ¢ĞĞ¢&WGW&âçVÆÀĞ¢ĞĞ Ğ¢&—fFRgVâf–æDÆ–¶VÇ•&÷t6öçF–æW"†æöFS¢66W76–&–Æ—G”æöFT–æfò“¢66W76–&–Æ—G”æöFT–æfóò°Ğ¢f"&W7C¢66W76–&–Æ—G”æöFT–æfóòÒæöFPĞ¢f"7W"ÒæöFRç&Vç@Ğ¢&WVBƒR’°Ğ¢–b†7W"ÓÒçVÆÂ’&WGW&â&W7@Ğ¢fÂ"Ò&÷VæG4öb†7W"Ğ¢fÂ‚Ò"æ†V–v‡B‚Ğ¢fÂrÒ"çv–GF‚‚Ğ¢–b†‚–âGƒ3b’âæGƒ"’bbrâ&W6÷W&6W2æF—7Æ”ÖWG&–72çv–GF…—†VÇ2¢ãCR’°Ğ¢&W7BÒ7W Ğ¢ĞĞ¢7W"Ò7W"ç&Vç@Ğ¢ĞĞ¢&WGW&â&W7@Ğ¢ĞĞ Ğ¢&—fFRgVâÆ&VÄöb†æöFS¢66W76–&–Æ—G”æöFT–æfò“¢7G&–ær°Ğ¢fÂ'G2ÒÆ—7Döb€Ğ¢æöFRçFW‡CòçFõ7G&–ær‚’æ÷$V×G’‚’ÀĞ¢æöFRæ6öçFVçDFW67&—F–öãòçFõ7G&–ær‚’æ÷$V×G’‚’ÀĞ¢æöFRçf–Wt–E&W6÷W&6TæÖRæ÷$V×G’‚Ğ¢Ğ¢&WGW&â'G2æf–ÇFW"²—Bæ—4æ÷D&Ææ²‚’Òæ¦ö–åFõ7G&–ær‚""Ğ¢ĞĞ Ğ¢&—fFRgVâÆ&VÅv—F„6†–ÆG&Vâ†æöFS¢66W76–&–Æ—G”æöFT–æfò“¢7G&–ær°Ğ¢fÂ÷WBÒ7G&–æt'V–ÆFW"†Æ&VÄöb†æöFR’Ğ¢gVâvÆ²†ã¢66W76–&–Æ—G”æöFT–æfòÂFWFƒ¢–çB’°Ğ¢–b†FWF‚â2’&WGW&àĞ¢f÷"†’–âVçF–Ââæ6†–ÆD6÷VçB’°Ğ¢fÂ6†–ÆBÒâævWD6†–ÆB†’’ó¢6öçF–çVPĞ¢fÂÆ&VÂÒÆ&VÄöb†6†–ÆBĞ¢–b†Æ&VÂæ—4æ÷D&Ææ²‚’’÷WBæVæB‚rr’æVæB†Æ&VÂĞ¢vÆ²†6†–ÆBÂFWF‚²Ğ¢ĞĞ¢ĞĞ¢vÆ²†æöFRÂĞ¢&WGW&â÷WBçFõ7G&–ær‚Ğ¢ĞĞ Ğ¢&—fFRgVâ7G&–ærææ÷&ÖÆ—¦U–Ò‚“¢7G&–ærÒÆ÷vW&66R‚Ğ¢ç&WÆ6R‚}rÂ}RrĞ¢ç&WÆ6R…&VvW‚‚%µæ×­İóÓ•Ò²"’Â""Ğ Ğ¢&—fFRgVâ7G&–ærç7G&—W‡Æ–6—EG&6´Ö&¶W'2‚“¢7G&–ær°Ğ¢f"÷WBÒF†—0Ğ¢fÂÖ&¶W'2ÒÆ—7Döb€Ğ¢--]­íM]m-İ]İíÍ--İ=í½]­­2"ÀĞ¢-íM]m-İ]İíÍ--İ=í½]­­2"ÀĞ¢-İ]İíÍ--İı½]­­"ÀĞ¢-İ]İíÍ--İ=í½]­­2"ÀĞ¢-İ]İíÍ--İí½]­­í’"ÀĞ¢-Í-]İ½]½í-"ÀĞ¢--í­½m-]½Íİ½}İ­-­=mí}­R"ÀĞ¢--í­½m-]½Íİ½}İ¢"ÀĞ¢-}İ}í­-í­½m-]½Íİ½’"ÀĞ¢'&VçFÆGf—6÷'’"ÀĞ¢&W‡Æ–6—FÇ—&–72"ÀĞ¢&W‡Æ–6—F6öçFVçB"ÀĞ¢&W‡Æ–6—B Ğ¢Ğ¢Ö&¶W'2æf÷$V6‚²Ö&¶W"Óâ÷WBÒ÷WBç&WÆ6R†Ö&¶W"Â""’ĞĞ¢&WGW&â÷W@Ğ¢ĞĞ Ğ¢&—fFRgVâ&÷VæG4öb†æöFS¢66W76–&–Æ—G”æöFT–æfò“¢&V7BÒ&V7B‚’æÇ6ò²æöFRævWD&÷VæG4–å67&VVâ†—B’ĞĞ Ğ¢&—fFRgVâWFFT†–W&&6‡”GV×‡&ö÷C¢66W76–&–Æ—G”æöFT–æfò’°Ğ¢fÂÆÂÒ×WF&ÆTÆ—7DöcÄ66W76–&–Æ—G”æöFT–æfóâ‚Ğ¢6öÆÆV7B‡&ö÷BÂÆÂĞ¢Æ7D†–W&&6‡”GV×ÒÆÂæ56WVVæ6R‚Ğ¢æÖ–æFW†VDæ÷DçVÆÂ²–æFW‚ÂæöFRÓàĞ¢–b‚æöFRæ—5f—6–&ÆUFõW6W"’&WGW&äÖ–æFW†VDæ÷DçVÆÂçVÆÀĞ¢fÂ&tÆ&VÂÒÆ&VÄöb†æöFR’çG&–Ò‚Ğ¢–b‡&tÆ&VÂæ—4&Ææ²‚’’&WGW&äÖ–æFW†VDæ÷DçVÆÂçVÆÀĞ¢fÂ"Ò&÷VæG4öb†æöFRĞ¢fÂ6Æ–6¶&ÆRÒ–b†æöFRæ—46Æ–6¶&ÆR’"6Æ–6¶&ÆR"VÇ6R" Ğ¢fÂ6VÆV7FVBÒv†Vâ°Ğ¢æöFRæ—56VÆV7FVBÓâ"6VÆV7FVB Ğ¢æöFRæ—4fö7W6VBÓâ"fö7W6VB Ğ¢æöFRæ—466W76–&–Æ—G”fö7W6VBÓâ"66W76–&–Æ—G”fö7W6VB Ğ¢VÇ6RÓâ" Ğ¢ĞĞ¢"2F–æFW‚G·&tÆ&VÂçF¶Rƒ“—Ò²G%ÒF6Æ–6¶&ÆRG6VÆV7FVB Ğ¢ĞĞ¢æF—7F–æ7B‚Ğ¢çF¶RƒƒĞ¢æ¦ö–åFõ7G&–ær‚%Æâ"Ğ¢ĞĞ Ğ¢&—fFRgVâ6öÆÆV7B†æöFS¢66W76–&–Æ—G”æöFT–æfòÂ÷WC¢×WF&ÆTÆ—7CÄ66W76–&–Æ—G”æöFT–æfóâ’°Ğ¢÷WB³ÒæöFPĞ¢f÷"†’–âVçF–ÂæöFRæ6†–ÆD6÷VçB’°Ğ¢æöFRævWD6†–ÆB†’“òæÆWB²6öÆÆV7B†—BÂ÷WB’ĞĞ¢ĞĞ¢ĞĞ Ğ¢&—fFRgVâG‡fÇVS¢–çB“¢–çBÒ‡fÇVR¢&W6÷W&6W2æF—7Æ”ÖWG&–72æFVç6—G’’çFô–çB‚Ğ Ğ¢&—fFRFF6Æ726æF–FFR€Ğ¢fÂæöFS¢66W76–&–Æ—G”æöFT–æfòÀĞ¢fÂ&÷VæG3¢&V7BÀĞ¢fÂ66÷&S¢–çBÀĞ¢fÂÆ&VÃ¢7G&–æpĞ¢Ğ§ĞĞ

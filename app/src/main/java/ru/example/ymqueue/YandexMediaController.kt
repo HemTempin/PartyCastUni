@@ -43,8 +43,16 @@ object YandexMediaController {
         val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
         if (title.isBlank() && artist.isBlank()) return emptyArray()
         val duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(0L)
-        val position = c.playbackState?.position?.coerceAtLeast(0L) ?: 0L
-        val playing = c.playbackState?.state == PlaybackState.STATE_PLAYING
+        val state = c.playbackState
+        val playing = state?.state == PlaybackState.STATE_PLAYING
+        val basePosition = state?.position?.coerceAtLeast(0L) ?: 0L
+        val elapsedSinceUpdate = if (playing && state != null && state.lastPositionUpdateTime > 0L) {
+            (SystemClock.elapsedRealtime() - state.lastPositionUpdateTime).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val estimatedPosition = basePosition + (elapsedSinceUpdate * (state?.playbackSpeed ?: 1f)).toLong()
+        val position = if (duration > 0L) estimatedPosition.coerceIn(0L, duration) else estimatedPosition.coerceAtLeast(0L)
         return arrayOf(title, artist, duration.toString(), position.toString(), playing.toString())
     }
 
