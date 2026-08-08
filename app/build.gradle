@@ -33,6 +33,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            versionNameSuffix ' (deb)'
+        }
+
         release {
             if (hasReleaseSigning) {
                 signingConfig signingConfigs.release
