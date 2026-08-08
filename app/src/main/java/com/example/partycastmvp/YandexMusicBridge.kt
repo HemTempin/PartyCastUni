@@ -1,7 +1,10 @@
 package com.example.partycastmvp
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -238,6 +241,43 @@ object YandexMusicBridge {
     @JvmStatic
     fun openNotificationListenerSettings(context: Context) {
         context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+
+    @JvmStatic
+    fun openAppDetailsSettings(context: Context) {
+        val intent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:${context.packageName}")
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+    }
+
+    @JvmStatic
+    fun hasNotificationListenerAccess(context: Context): Boolean {
+        val expected = ComponentName(context, ru.example.ymqueue.YandexNotificationListenerService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            return manager.isNotificationListenerAccessGranted(expected)
+        }
+        return enabledComponentList(context, "enabled_notification_listeners").contains(expected)
+    }
+
+    @JvmStatic
+    fun hasAccessibilityAccess(context: Context): Boolean {
+        val expected = ComponentName(context, YandexAccessibilityService::class.java)
+        return Settings.Secure.getInt(
+            context.contentResolver,
+            Settings.Secure.ACCESSIBILITY_ENABLED,
+            0
+        ) == 1 && enabledComponentList(
+            context,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ).contains(expected)
+    }
+
+    private fun enabledComponentList(context: Context, settingName: String): Set<ComponentName> {
+        val raw = Settings.Secure.getString(context.contentResolver, settingName).orEmpty()
+        return raw.split(':').mapNotNull(ComponentName::unflattenFromString).toSet()
     }
 
     @JvmStatic
